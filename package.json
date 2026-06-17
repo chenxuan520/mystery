@@ -1,0 +1,32 @@
+{
+  "name": "mystery-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mystery-cli": "dist/src/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "web": "tsx src/web/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "test": "vitest run",
+    "harness:cases": "tsx src/harness/case-harness.ts"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^7.6.0",
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "openai": "^4.86.1",
+    "yaml": "^2.5.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.7"
+  }
+}

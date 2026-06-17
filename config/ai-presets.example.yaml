@@ -1,0 +1,15 @@
+presets:
+  - id: deepseek-v4-pro
+    name: DeepSeek-V4-Pro
+    endpoint: https://your-openai-compatible-endpoint/v1
+    token: your_token_here
+    model: deepseek-v4-pro
+    structured_output: tool_call
+
+  - id: reviewer-json
+    name: Reviewer JSON Model
+    endpoint: https://your-openai-compatible-endpoint/v1
+    token: your_token_here
+    model: some-json-friendly-model
+    structured_output: json_object
+    max_tokens: 1200
