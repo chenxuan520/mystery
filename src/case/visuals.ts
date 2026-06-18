@@ -29,6 +29,10 @@ type InvestigationNodeLike = {
 type MysteryCaseLike = {
   id: string;
   title: string;
+  victim: {
+    name: string;
+    profile: string;
+  };
   storyContext: {
     setting: string;
     currentSituation: string;
@@ -63,6 +67,21 @@ type MysteryCaseLike = {
 };
 
 type SceneFigureLike = NonNullable<MysteryCaseLike["sceneIllustration"]>["figures"][number];
+
+const SCENE_SUPPLEMENTAL_POSITIONS: Record<"suspect" | "npc", Array<{ x: number; y: number }>> = {
+  suspect: [
+    { x: 20, y: 22 },
+    { x: 80, y: 22 },
+    { x: 18, y: 76 },
+    { x: 82, y: 76 },
+    { x: 50, y: 18 },
+  ],
+  npc: [
+    { x: 10, y: 48 },
+    { x: 90, y: 48 },
+    { x: 50, y: 86 },
+  ],
+};
 
 const PALETTES = [
   ["#1d4ed8", "#0f172a", "#93c5fd", "#e2e8f0"],
@@ -139,7 +158,11 @@ function renderTextLines(lines: string[], x: number, y: number, lineHeight: numb
     .join("");
 }
 
-function pickPalette(seed: string) {
+function pickPalette(seed: string, preferredIndex?: number) {
+  if (typeof preferredIndex === "number") {
+    return PALETTES[((preferredIndex % PALETTES.length) + PALETTES.length) % PALETTES.length] ?? PALETTES[0]!;
+  }
+
   return PALETTES[hashString(seed) % PALETTES.length] ?? PALETTES[0]!;
 }
 
@@ -155,8 +178,8 @@ function projectSceneY(percent: number) {
   return clampPosition(90 + (percent / 100) * 230, 90, 320);
 }
 
-function renderPortraitSvg(character: CharacterLike, seed: string, badge: string) {
-  const [primary, background, accent, text] = pickPalette(seed);
+function renderPortraitSvg(character: CharacterLike, seed: string, badge: string, paletteIndex?: number) {
+  const [primary, background, accent, text] = pickPalette(seed, paletteIndex);
   const variant = hashString(`${seed}:portrait`) % 4;
   const eyeY = variant % 2 === 0 ? 92 : 88;
   const mouthY = variant < 2 ? 118 : 124;
@@ -256,11 +279,55 @@ function renderSceneFigure(
   `;
 }
 
+function ensureSceneFigures(mysteryCase: MysteryCaseLike): SceneFigureLike[] {
+  const baseFigures = [...(mysteryCase.sceneIllustration?.figures ?? [])];
+  const seenCharacterIds = new Set(baseFigures.map((figure) => figure.characterId).filter(Boolean));
+  const normalizedLabels = new Set(baseFigures.map((figure) => figure.label.trim()));
+
+  if (!baseFigures.some((figure) => figure.role === "victim" || figure.label.trim() === mysteryCase.victim.name.trim())) {
+    baseFigures.unshift({
+      label: mysteryCase.victim.name,
+      role: "victim",
+      position: { x: 52, y: 58 },
+      pose: "倒在现场中央或关键物件旁",
+      expression: "失去反应",
+    });
+  }
+
+  const addFigure = (role: "suspect" | "npc", character: CharacterLike, expression = character.publicPersona) => {
+    if (seenCharacterIds.has(character.id) || normalizedLabels.has(character.name.trim())) {
+      return;
+    }
+
+    const position = SCENE_SUPPLEMENTAL_POSITIONS[role][baseFigures.filter((figure) => figure.role === role).length] ?? { x: 12 + baseFigures.length * 8, y: role === "suspect" ? 18 : 86 };
+    baseFigures.push({
+      characterId: character.id,
+      label: character.name,
+      role,
+      position,
+      pose: role === "suspect" ? "站在案发空间边缘，观察现场" : "站在场景边缘观察局势",
+      expression,
+    });
+    seenCharacterIds.add(character.id);
+    normalizedLabels.add(character.name.trim());
+  };
+
+  for (const suspect of mysteryCase.suspects) {
+    addFigure("suspect", suspect, suspect.publicPersona);
+  }
+
+  for (const npc of mysteryCase.npcs ?? []) {
+    addFigure("npc", npc, npc.publicPersona);
+  }
+
+  return baseFigures;
+}
+
 function renderSceneSvg(mysteryCase: MysteryCaseLike) {
   const [primary, background, accent, text] = pickPalette(`${mysteryCase.id}:scene`);
   const scene = mysteryCase.sceneIllustration;
   const props = scene?.props ?? [];
-  const figures = scene?.figures ?? [];
+  const figures = ensureSceneFigures(mysteryCase);
   const locationChip = truncateLabel(scene?.locationLabel ?? mysteryCase.title, 10);
 
   return `
@@ -366,18 +433,38 @@ function renderClueSvg(node: InvestigationNodeLike, seed: string) {
 export function applyCaseVisuals<T extends MysteryCaseLike>(mysteryCase: T): T {
   return {
     ...mysteryCase,
-    sceneSvg: mysteryCase.sceneSvg ?? renderSceneSvg(mysteryCase),
+    sceneSvg: renderSceneSvg(mysteryCase),
     suspects: mysteryCase.suspects.map((suspect, index) => ({
       ...suspect,
-      avatarSvg: suspect.avatarSvg ?? renderPortraitSvg(suspect, `${mysteryCase.id}:suspect:${index}:${suspect.name}`, "嫌疑人"),
+      avatarSvg: suspect.avatarSvg ?? renderPortraitSvg(suspect, `${mysteryCase.id}:suspect:${index}:${suspect.name}`, "嫌疑人", index),
     })),
     npcs: (mysteryCase.npcs ?? []).map((npc, index) => ({
       ...npc,
-      avatarSvg: npc.avatarSvg ?? renderPortraitSvg(npc, `${mysteryCase.id}:npc:${index}:${npc.name}`, "相关人物"),
+      avatarSvg:
+        npc.avatarSvg ?? renderPortraitSvg(npc, `${mysteryCase.id}:npc:${index}:${npc.name}`, "相关人物", mysteryCase.suspects.length + index),
     })),
     investigationNodes: mysteryCase.investigationNodes.map((node, index) => ({
       ...node,
       visualSvg: node.visualSvg,
+    })),
+  };
+}
+
+export function stripCaseVisualAssets<T extends MysteryCaseLike>(mysteryCase: T): T {
+  return {
+    ...mysteryCase,
+    sceneSvg: undefined,
+    suspects: mysteryCase.suspects.map((suspect) => ({
+      ...suspect,
+      avatarSvg: undefined,
+    })),
+    npcs: (mysteryCase.npcs ?? []).map((npc) => ({
+      ...npc,
+      avatarSvg: undefined,
+    })),
+    investigationNodes: mysteryCase.investigationNodes.map((node) => ({
+      ...node,
+      visualSvg: undefined,
     })),
   };
 }

@@ -1,10 +1,13 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
 import type { InvestigationNode, MysteryCase, Npc, Suspect } from "../case/schema.js";
-import type { StoredMessage } from "../session/store.js";
 import type { OpenAiGateway } from "../llm/openai-gateway.js";
 
 export type DialogueCharacter = Suspect | Npc;
+export type DialogueHistoryMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
 
 function isSuspect(character: DialogueCharacter): character is Suspect {
   return "possibleMotive" in character;
@@ -47,7 +50,7 @@ export function buildSuspectMessages(
   mysteryCase: MysteryCase,
   character: DialogueCharacter,
   knownNodes: InvestigationNode[],
-  history: StoredMessage[],
+  history: DialogueHistoryMessage[],
   userInput: string,
 ): ChatCompletionMessageParam[] {
   const messages: ChatCompletionMessageParam[] = [
@@ -73,7 +76,7 @@ export async function generateSuspectReply(
   mysteryCase: MysteryCase,
   character: DialogueCharacter,
   knownNodes: InvestigationNode[],
-  history: StoredMessage[],
+  history: DialogueHistoryMessage[],
   userInput: string,
 ) {
   return gateway.chat(buildSuspectMessages(mysteryCase, character, knownNodes, history, userInput), 0.8);
@@ -84,7 +87,7 @@ export function streamSuspectReply(
   mysteryCase: MysteryCase,
   character: DialogueCharacter,
   knownNodes: InvestigationNode[],
-  history: StoredMessage[],
+  history: DialogueHistoryMessage[],
   userInput: string,
 ) {
   return gateway.streamChat(buildSuspectMessages(mysteryCase, character, knownNodes, history, userInput), 0.8);

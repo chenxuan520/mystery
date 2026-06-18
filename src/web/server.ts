@@ -1,28 +1,41 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-import { archiveApprovedCase, DEFAULT_ARCHIVE_DIR, listArchivedCases, loadArchivedCase } from "../archive/story-archive.js";
+import { archiveApprovedCase, DEFAULT_ARCHIVE_DIR, deleteArchivedCase, importArchivePayload, listArchivedCases, loadArchivedCase } from "../archive/story-archive.js";
+import { CASE_TEMPLATES } from "../case/templates.js";
 import { generateCasePackageWithDiagnostics, PLAYABLE_CASE_GENERATION_OPTIONS } from "../case/generator.js";
-import type { InvestigationNode, MysteryCase, Npc, Suspect } from "../case/schema.js";
+import type { InvestigationNode, MysteryCase, Npc, Suspect, TemplateType } from "../case/schema.js";
+import { sanitizeDialogueHistory } from "../chat/dialogue-memory.js";
+import { buildHintMasterCharacter, HINT_MASTER_ID, streamHintMasterReply } from "../chat/hint-master.js";
 import { streamSuspectReply } from "../chat/suspect-chat.js";
-import { loadRuntimeConfig, loadRuntimeConfigForRole } from "../config/runtime-config.js";
+import { loadAdminAuthConfig, loadAdminModelPresets, serializeAdminModelOptions } from "../config/admin-config.js";
+import { loadRuntimeConfig, loadRuntimeConfigForRole, loadRuntimeConfigFromPresetId } from "../config/runtime-config.js";
+import { loadVoiceInputConfig, serializeVoiceInputConfig } from "../config/voice-input-config.js";
 import { judgeAccusation, revealSolution } from "../judgement/judge.js";
 import { OpenAiGateway } from "../llm/openai-gateway.js";
-import { SessionStore, type StoredSession } from "../session/store.js";
+import { SessionStore, type StoredGenerationFailure, type StoredSession } from "../session/store.js";
+import {
+  createVolcengineRecognitionSession,
+  diffSuffix,
+  transcribePcm16WithVolcengine,
+  type VoiceRecognitionSession,
+} from "../voice/volcengine-asr.js";
 
 const playConfig = loadRuntimeConfig();
-const generationConfig = loadRuntimeConfigForRole("generator");
-const reviewConfig = loadRuntimeConfigForRole("reviewer");
-
-const playGateway = new OpenAiGateway(playConfig);
-const generationGateway = new OpenAiGateway(generationConfig);
-const reviewGateway = new OpenAiGateway(reviewConfig);
+const adminAuthConfig = loadAdminAuthConfig();
+const adminModelPresets = loadAdminModelPresets();
+const voiceInputConfig = loadVoiceInputConfig();
 const archiveDir = process.env.ARCHIVE_DIR ?? DEFAULT_ARCHIVE_DIR;
 const store = new SessionStore(playConfig.databasePath);
 const generationJobs = new Map<string, GenerationJob>();
+const voiceInputSessions = new Map<string, VoiceInputSession>();
 
 const HOST = process.env.WEB_HOST ?? "127.0.0.1";
 const PORT = Number(process.env.WEB_PORT ?? 3001);
+const ADMIN_COOKIE_NAME = "mystery_admin_session";
+const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
+const ADMIN_TOKEN_VERSION = "v1";
 
 type GenerationJob = {
   id: string;
@@ -48,7 +61,55 @@ type GenerationProgressState = {
   totalAttempts: number;
 };
 
+type VoiceInputSession = {
+  id: string;
+  recognition: VoiceRecognitionSession;
+  pendingStableText: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AdminModelSelection = {
+  playPresetId?: string;
+  generatorPresetId?: string;
+  reviewerPresetId?: string;
+};
+
 const GENERATION_HEARTBEAT_MS = 5000;
+const VOICE_INPUT_SESSION_STALE_MS = 5 * 60 * 1000;
+
+function getAdminModelSelection(): AdminModelSelection {
+  const stored =
+    store.getSetting<AdminModelSelection>("admin.modelSelection") ?? {
+      playPresetId: process.env.AI_PRESET_ID,
+      generatorPresetId: process.env.CASE_GENERATOR_PRESET_ID,
+      reviewerPresetId: process.env.CASE_REVIEWER_PRESET_ID,
+    };
+
+  return {
+    playPresetId: normalizeAdminSelectionValue(stored.playPresetId),
+    generatorPresetId: normalizeAdminSelectionValue(stored.generatorPresetId),
+    reviewerPresetId: normalizeAdminSelectionValue(stored.reviewerPresetId),
+  };
+}
+
+function resolveRuntimeConfigWithSelection(role: "default" | "generator" | "reviewer") {
+  const selection = getAdminModelSelection();
+  const presetId = role === "default" ? selection.playPresetId : role === "generator" ? selection.generatorPresetId : selection.reviewerPresetId;
+  return presetId ? loadRuntimeConfigFromPresetId(presetId) : loadRuntimeConfigForRole(role);
+}
+
+function getPlayGateway() {
+  return new OpenAiGateway(resolveRuntimeConfigWithSelection("default"));
+}
+
+function getGenerationGateway() {
+  return new OpenAiGateway(resolveRuntimeConfigWithSelection("generator"));
+}
+
+function getReviewGateway() {
+  return new OpenAiGateway(resolveRuntimeConfigWithSelection("reviewer"));
+}
 
 function getLatestActiveGenerationJob() {
   return [...generationJobs.values()]
@@ -71,6 +132,75 @@ function serializeGenerationJobPreview(job: GenerationJob) {
   };
 }
 
+function serializeStoredGenerationFailure(failure: StoredGenerationFailure) {
+  return {
+    id: failure.jobId,
+    status: "failed" as const,
+    progress: {
+      phase: failure.phase ?? "failed",
+      message: failure.progressMessage ?? failure.error,
+      attempt: failure.attempt ?? 0,
+      totalAttempts: failure.totalAttempts ?? 0,
+    },
+    error: failure.error,
+    rawError: failure.rawError,
+    partialOutput: failure.partialOutput,
+    templateType: failure.templateType,
+    createdAt: failure.createdAt,
+    updatedAt: failure.createdAt,
+  };
+}
+
+function truncateFailurePartialOutput(text: string | undefined, maxChars = 8000) {
+  if (!text) {
+    return undefined;
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (trimmed.length <= maxChars) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, maxChars)}…`;
+}
+
+function buildStoredGenerationFailure(
+  jobId: string,
+  templateType: TemplateType | undefined,
+  error: unknown,
+  generatorMeta: ReturnType<OpenAiGateway["describe"]>,
+  reviewMeta: ReturnType<OpenAiGateway["describe"]>,
+): StoredGenerationFailure {
+  const currentJob = generationJobs.get(jobId);
+  const rawError = error instanceof Error ? error.message : String(error);
+  const partialOutput =
+    error && typeof error === "object" && typeof (error as { partialOutput?: unknown }).partialOutput === "string"
+      ? truncateFailurePartialOutput((error as { partialOutput?: string }).partialOutput)
+      : undefined;
+
+  return {
+    id: `generation_failure_${crypto.randomUUID()}`,
+    jobId,
+    templateType,
+    phase: currentJob?.progress?.phase,
+    progressMessage: currentJob?.progress?.message,
+    attempt: currentJob?.progress?.attempt,
+    totalAttempts: currentJob?.progress?.totalAttempts,
+    error: formatUserVisibleGenerationError(error),
+    rawError,
+    partialOutput,
+    generatorModel: generatorMeta.model,
+    reviewModel: reviewMeta.model,
+    generatorPresetId: generatorMeta.presetId,
+    reviewPresetId: reviewMeta.presetId,
+    createdAt: new Date().toISOString(),
+  };
+}
+
 function collectExistingCaseTitles() {
   return Array.from(new Set([...store.listCaseTitles(), ...listArchivedCases(archiveDir).map((item) => item.title)]));
 }
@@ -85,9 +215,13 @@ function readStaticFile(relativePath: string) {
 }
 
 const INDEX_HTML = readStaticFile("index.html");
+const ADMIN_HTML = readStaticFile("admin.html");
 const APP_JS = readStaticFile("app.js");
+const ADMIN_JS = readStaticFile("admin.js");
 const STYLES_CSS = readStaticFile("styles.css");
 const FAVICON_SVG = readStaticFile("favicon.svg");
+const SWEETALERT_JS = readFileSync(new URL("../../node_modules/sweetalert2/dist/sweetalert2.all.min.js", import.meta.url), "utf-8");
+const SWEETALERT_CSS = readFileSync(new URL("../../node_modules/sweetalert2/dist/sweetalert2.min.css", import.meta.url), "utf-8");
 
 function visitedNodes(mysteryCase: MysteryCase, session: StoredSession): InvestigationNode[] {
   return mysteryCase.investigationNodes.filter((node) => session.state.visitedNodeIds.includes(node.id));
@@ -114,6 +248,7 @@ function getSessionContext(sessionId: string) {
 function serializeSession(mysteryCase: MysteryCase, session: StoredSession) {
   return {
     sessionId: session.id,
+    caseId: mysteryCase.id,
     status: session.status,
     title: mysteryCase.title,
     openingNarration: mysteryCase.openingNarration,
@@ -142,6 +277,7 @@ function serializeSession(mysteryCase: MysteryCase, session: StoredSession) {
       appearanceSummary: npc.appearanceSummary,
       avatarSvg: npc.avatarSvg,
     })),
+    hintMaster: buildHintMasterCharacter(),
     investigationNodes: mysteryCase.investigationNodes.map((node) => ({
       id: node.id,
       title: node.title,
@@ -160,34 +296,37 @@ function serializeSession(mysteryCase: MysteryCase, session: StoredSession) {
 }
 
 function serializeBootstrap() {
-  const latestSession = store.getLatestActiveSession();
-  const latestCase = latestSession ? store.getCase(latestSession.caseId) : null;
   const activeGenerationJob = getLatestActiveGenerationJob();
   const latestGenerationJob = getLatestGenerationJob();
+  const latestGenerationFailure = store.getLatestGenerationFailure();
+  const playGateway = getPlayGateway();
+  const generationGateway = getGenerationGateway();
+  const reviewGateway = getReviewGateway();
 
   return {
-    latestSession:
-      latestSession && latestCase
-        ? {
-            sessionId: latestSession.id,
-            title: latestCase.title,
-            summary: latestCase.publicSummary,
-          }
-        : null,
     activeGenerationJob: activeGenerationJob ? serializeGenerationJobPreview(activeGenerationJob) : null,
     latestGenerationJob: latestGenerationJob ? serializeGenerationJobPreview(latestGenerationJob) : null,
+    latestGenerationFailure: latestGenerationFailure ? serializeStoredGenerationFailure(latestGenerationFailure) : null,
     archives: listArchivedCases(archiveDir).map((item) => ({
       archiveId: item.archiveId,
+      caseId: item.caseId,
       title: item.title,
       template: item.template,
       suspects: item.suspects,
       overallScore: item.overallScore,
+      archivedAt: item.archivedAt,
+      sourceModel: item.sourceModel,
+      reviewModel: item.reviewModel,
+      presetId: item.presetId,
+      reviewPresetId: item.reviewPresetId,
     })),
     models: {
       play: playGateway.describe(),
       generator: generationGateway.describe(),
       reviewer: reviewGateway.describe(),
     },
+    voiceInput: serializeVoiceInputConfig(voiceInputConfig),
+    adminEnabled: adminAuthConfig.enabled,
   };
 }
 
@@ -202,6 +341,199 @@ async function readJsonBody(request: IncomingMessage) {
   }
 
   return JSON.parse(raw) as Record<string, unknown>;
+}
+
+async function readBinaryBody(request: IncomingMessage, maxBytes: number) {
+  const chunks: Buffer[] = [];
+  let total = 0;
+
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > maxBytes) {
+      throw new Error("语音输入音频过长，请缩短后重试。");
+    }
+    chunks.push(buffer);
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function touchVoiceInputSession(sessionId: string) {
+  const session = voiceInputSessions.get(sessionId);
+  if (!session) {
+    return;
+  }
+
+  session.updatedAt = new Date().toISOString();
+}
+
+async function cleanupStaleVoiceInputSessions() {
+  const now = Date.now();
+  const staleSessions = [...voiceInputSessions.values()].filter((session) => {
+    const updatedAt = Date.parse(session.updatedAt);
+    return Number.isFinite(updatedAt) && now - updatedAt > VOICE_INPUT_SESSION_STALE_MS;
+  });
+
+  for (const session of staleSessions) {
+    voiceInputSessions.delete(session.id);
+    await session.recognition.abort().catch(() => undefined);
+  }
+}
+
+function drainVoiceInputStableText(sessionId: string) {
+  const session = voiceInputSessions.get(sessionId);
+  if (!session || session.pendingStableText.length === 0) {
+    return "";
+  }
+
+  const text = session.pendingStableText.join("");
+  session.pendingStableText = [];
+  session.updatedAt = new Date().toISOString();
+  return text;
+}
+
+function parseCookies(request: IncomingMessage): Record<string, string> {
+  const raw = request.headers.cookie ?? "";
+  return Object.fromEntries(
+    raw
+      .split(";")
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const index = part.indexOf("=");
+        if (index === -1) {
+          return [part, ""];
+        }
+        return [part.slice(0, index), decodeURIComponent(part.slice(index + 1))];
+      }),
+  );
+}
+
+function encodeBase64Url(value: string) {
+  return Buffer.from(value, "utf8").toString("base64url");
+}
+
+function decodeBase64Url(value: string) {
+  return Buffer.from(value, "base64url").toString("utf8");
+}
+
+function adminTokenSecret() {
+  return `${ADMIN_TOKEN_VERSION}:${adminAuthConfig.username}:${adminAuthConfig.password}:${playConfig.databasePath}`;
+}
+
+function signAdminToken(payloadEncoded: string) {
+  return createHmac("sha256", adminTokenSecret()).update(payloadEncoded).digest("base64url");
+}
+
+function createAdminToken() {
+  const payloadEncoded = encodeBase64Url(
+    JSON.stringify({
+      u: adminAuthConfig.username,
+      exp: Date.now() + ADMIN_SESSION_TTL_MS,
+    }),
+  );
+  return `${payloadEncoded}.${signAdminToken(payloadEncoded)}`;
+}
+
+function verifyAdminToken(token: string) {
+  const separatorIndex = token.lastIndexOf(".");
+  if (separatorIndex <= 0) {
+    return false;
+  }
+
+  const payloadEncoded = token.slice(0, separatorIndex);
+  const signature = token.slice(separatorIndex + 1);
+  const expectedSignature = signAdminToken(payloadEncoded);
+
+  const left = Buffer.from(signature);
+  const right = Buffer.from(expectedSignature);
+  if (left.length !== right.length || !timingSafeEqual(left, right)) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(decodeBase64Url(payloadEncoded)) as { u?: string; exp?: number };
+    return payload.u === adminAuthConfig.username && typeof payload.exp === "number" && payload.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function getAdminSessionToken(request: IncomingMessage) {
+  const cookies = parseCookies(request);
+  return cookies[ADMIN_COOKIE_NAME];
+}
+
+function isAdminAuthenticated(request: IncomingMessage) {
+  const token = getAdminSessionToken(request);
+  return token ? verifyAdminToken(token) : false;
+}
+
+function sendAdminSessionCookie(response: ServerResponse, token: string) {
+  response.setHeader(
+    "Set-Cookie",
+    `${ADMIN_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(ADMIN_SESSION_TTL_MS / 1000)}`,
+  );
+}
+
+function clearAdminSessionCookie(response: ServerResponse) {
+  response.setHeader("Set-Cookie", `${ADMIN_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+}
+
+function assertAdminAccess(request: IncomingMessage, response: ServerResponse) {
+  if (!adminAuthConfig.enabled) {
+    sendJson(response, 503, { error: "当前未配置 admin 账号密码。" });
+    return false;
+  }
+
+  if (!isAdminAuthenticated(request)) {
+    sendJson(response, 401, { error: "请先登录 admin。" });
+    return false;
+  }
+
+  return true;
+}
+
+function serializeAdminBootstrap() {
+  const activeGenerationJob = getLatestActiveGenerationJob();
+  const latestGenerationJob = getLatestGenerationJob();
+  const latestGenerationFailure = store.getLatestGenerationFailure();
+
+  return {
+    user: adminAuthConfig.enabled ? adminAuthConfig.username : null,
+    authenticated: true,
+    archives: listArchivedCases(archiveDir).map((item) => ({
+      archiveId: item.archiveId,
+      caseId: item.caseId,
+      title: item.title,
+      template: item.template,
+      suspects: item.suspects,
+      overallScore: item.overallScore,
+      archivedAt: item.archivedAt,
+      sourceModel: item.sourceModel,
+      reviewModel: item.reviewModel,
+      presetId: item.presetId,
+      reviewPresetId: item.reviewPresetId,
+    })),
+    templates: CASE_TEMPLATES.map((template) => ({
+      type: template.type,
+      label: template.label,
+      brief: template.brief,
+    })),
+    models: {
+      options: serializeAdminModelOptions(adminModelPresets),
+      selection: getAdminModelSelection(),
+      current: {
+        play: getPlayGateway().describe(),
+        generator: getGenerationGateway().describe(),
+        reviewer: getReviewGateway().describe(),
+      },
+    },
+    activeGenerationJob: activeGenerationJob ? serializeGenerationJobPreview(activeGenerationJob) : null,
+    latestGenerationJob: latestGenerationJob ? serializeGenerationJobPreview(latestGenerationJob) : null,
+    latestGenerationFailure: latestGenerationFailure ? serializeStoredGenerationFailure(latestGenerationFailure) : null,
+  };
 }
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown) {
@@ -262,8 +594,10 @@ function formatUserVisibleGenerationError(error: unknown) {
   return errorMessage;
 }
 
-async function createNewSession(jobId?: string) {
+async function createNewSession(templateType?: TemplateType, jobId?: string) {
   console.log("[Web] 开始生成可玩案件...");
+  const generationGateway = getGenerationGateway();
+  const reviewGateway = getReviewGateway();
   const startedAt = Date.now();
   let latestProgress: GenerationProgressState = {
     phase: "starting",
@@ -290,7 +624,7 @@ async function createNewSession(jobId?: string) {
   try {
     const result = await generateCasePackageWithDiagnostics(
       generationGateway,
-      undefined,
+      templateType,
       reviewGateway,
       {
         ...PLAYABLE_CASE_GENERATION_OPTIONS,
@@ -347,9 +681,11 @@ async function createNewSession(jobId?: string) {
   }
 }
 
-function startGenerationJob() {
+function startGenerationJob(templateType?: TemplateType) {
   const jobId = `job_${crypto.randomUUID()}`;
   const now = new Date().toISOString();
+  const generatorMeta = getGenerationGateway().describe();
+  const reviewMeta = getReviewGateway().describe();
   generationJobs.set(jobId, {
     id: jobId,
     status: "queued",
@@ -375,7 +711,7 @@ function startGenerationJob() {
         },
       });
 
-      const result = await createNewSession(jobId);
+      const result = await createNewSession(templateType, jobId);
       updateGenerationJob(jobId, {
         status: "completed",
         session: result.session,
@@ -390,6 +726,7 @@ function startGenerationJob() {
       });
     } catch (error) {
       const userVisibleMessage = formatUserVisibleGenerationError(error);
+      store.recordGenerationFailure(buildStoredGenerationFailure(jobId, templateType, error, generatorMeta, reviewMeta));
       console.error("[Web] 生成案件失败：", error);
       updateGenerationJob(jobId, {
         status: "failed",
@@ -428,21 +765,22 @@ async function handleInvestigation(sessionId: string, nodeId: string) {
 }
 
 async function handleChatStream(request: IncomingMessage, response: ServerResponse, sessionId: string, suspectId: string) {
-  const { userInput } = (await readJsonBody(request)) as { userInput?: string };
+  const { userInput, history: rawHistory } = (await readJsonBody(request)) as { userInput?: string; history?: unknown };
   if (!userInput?.trim()) {
     sendJson(response, 400, { error: "聊天内容不能为空。" });
     return;
   }
 
   const { session, mysteryCase } = getSessionContext(sessionId);
-    const character = allCharacters(mysteryCase).find((item) => item.id === suspectId) as Suspect | Npc | undefined;
-    if (!character) {
-      sendJson(response, 404, { error: "角色不存在。" });
-      return;
-    }
+  const isHintMaster = suspectId === HINT_MASTER_ID;
+  const character = isHintMaster ? null : (allCharacters(mysteryCase).find((item) => item.id === suspectId) as Suspect | Npc | undefined);
+  if (!isHintMaster && !character) {
+    sendJson(response, 404, { error: "角色不存在。" });
+    return;
+  }
 
-  const history = store.listMessages(session.id, character.id);
-  store.appendMessage(session.id, character.id, "user", userInput.trim());
+  const history = sanitizeDialogueHistory(rawHistory);
+  store.touchSession(session.id);
 
   response.writeHead(200, {
     "Content-Type": "text/plain; charset=utf-8",
@@ -450,47 +788,355 @@ async function handleChatStream(request: IncomingMessage, response: ServerRespon
   });
 
   let assistantReply = "";
+  const playGateway = getPlayGateway();
 
   try {
-    for await (const chunk of streamSuspectReply(
-      playGateway,
-      mysteryCase,
-      character,
-      visitedNodes(mysteryCase, session),
-      history,
-      userInput.trim(),
-    )) {
+    const replyStream = isHintMaster
+      ? streamHintMasterReply(playGateway, mysteryCase, visitedNodes(mysteryCase, session), history, userInput.trim(), session.status === "solved")
+      : streamSuspectReply(playGateway, mysteryCase, character as Suspect | Npc, visitedNodes(mysteryCase, session), history, userInput.trim());
+
+    for await (const chunk of replyStream) {
       assistantReply += chunk;
       response.write(chunk);
     }
 
-    if (assistantReply.trim()) {
-      store.appendMessage(session.id, character.id, "assistant", assistantReply);
-    }
-
     response.end();
   } catch (error) {
-    if (assistantReply.trim()) {
-      store.appendMessage(session.id, character.id, "assistant", assistantReply);
-    }
-
     response.write(`\n\n[系统] 回复中断：${error instanceof Error ? error.message : String(error)}`);
     response.end();
   }
 }
 
+async function handleVoiceInputTranscription(request: IncomingMessage, response: ServerResponse) {
+  if (!voiceInputConfig) {
+    sendJson(response, 404, { error: "当前未配置语音输入。" });
+    return;
+  }
+
+  const maxBytes = Math.ceil(
+    voiceInputConfig.rate * voiceInputConfig.channels * (voiceInputConfig.bits / 8) * voiceInputConfig.maxDurationSeconds * 1.2,
+  );
+  const audioBuffer = await readBinaryBody(request, maxBytes);
+
+  if (audioBuffer.length === 0) {
+    sendJson(response, 400, { error: "音频内容不能为空。" });
+    return;
+  }
+
+  const transcript = await transcribePcm16WithVolcengine(audioBuffer, voiceInputConfig);
+  const text = (transcript.stableText || transcript.text || "").trim();
+
+  if (!text) {
+    sendJson(response, 422, { error: "没有识别到有效语音，请重试。" });
+    return;
+  }
+
+  sendJson(response, 200, {
+    text,
+    logId: transcript.logId,
+  });
+}
+
+async function handleStartVoiceInputSession(response: ServerResponse) {
+  if (!voiceInputConfig) {
+    sendJson(response, 404, { error: "当前未配置语音输入。" });
+    return;
+  }
+
+  void cleanupStaleVoiceInputSessions();
+
+  const sessionId = `voice_${crypto.randomUUID()}`;
+  const pendingStableText: string[] = [];
+  const recognition = await createVolcengineRecognitionSession(voiceInputConfig, {
+    onStableText: async (text) => {
+      pendingStableText.push(text);
+      touchVoiceInputSession(sessionId);
+    },
+  });
+
+  const now = new Date().toISOString();
+  voiceInputSessions.set(sessionId, {
+    id: sessionId,
+    recognition,
+    pendingStableText,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  sendJson(response, 200, {
+    sessionId,
+  });
+}
+
+async function handleVoiceInputChunk(request: IncomingMessage, response: ServerResponse, sessionId: string) {
+  const session = voiceInputSessions.get(sessionId);
+  if (!session || !voiceInputConfig) {
+    sendJson(response, 404, { error: "语音输入会话不存在。" });
+    return;
+  }
+
+  const maxChunkBytes = Math.max(
+    32 * 1024,
+    Math.ceil(voiceInputConfig.rate * voiceInputConfig.channels * (voiceInputConfig.bits / 8) * (voiceInputConfig.chunkMs / 1000) * 4),
+  );
+  const audioBuffer = await readBinaryBody(request, maxChunkBytes);
+  if (audioBuffer.length === 0) {
+    sendJson(response, 400, { error: "音频内容不能为空。" });
+    return;
+  }
+
+  session.recognition.write(audioBuffer);
+  touchVoiceInputSession(sessionId);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  sendJson(response, 200, {
+    text: drainVoiceInputStableText(sessionId),
+  });
+}
+
+async function handleStopVoiceInputSession(response: ServerResponse, sessionId: string) {
+  const session = voiceInputSessions.get(sessionId);
+  if (!session) {
+    sendJson(response, 404, { error: "语音输入会话不存在。" });
+    return;
+  }
+
+  try {
+    const result = await session.recognition.finish();
+    const stableDelta = drainVoiceInputStableText(sessionId);
+    const tailText = diffSuffix(result.stableText, result.text || result.stableText);
+
+    sendJson(response, 200, {
+      text: `${stableDelta}${tailText}`,
+      fullText: result.text || result.stableText,
+      logId: result.logId,
+    });
+  } finally {
+    voiceInputSessions.delete(sessionId);
+  }
+}
+
+async function handleAbortVoiceInputSession(response: ServerResponse, sessionId: string) {
+  const session = voiceInputSessions.get(sessionId);
+  if (!session) {
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  voiceInputSessions.delete(sessionId);
+  await session.recognition.abort().catch(() => undefined);
+  sendJson(response, 200, { ok: true });
+}
+
+function isValidAdminPresetId(value: unknown): value is string {
+  return typeof value === "string" && adminModelPresets.some((preset) => preset.id === value);
+}
+
+function normalizeAdminSelectionValue(value: unknown): string | undefined {
+  return isValidAdminPresetId(value) ? value : undefined;
+}
+
 async function routeApi(request: IncomingMessage, response: ServerResponse, pathname: string) {
+  if (request.method === "POST" && pathname === "/api/admin/login") {
+    if (!adminAuthConfig.enabled) {
+      sendJson(response, 503, { error: "当前未配置 admin 账号密码。" });
+      return;
+    }
+
+    const { username, password } = (await readJsonBody(request)) as { username?: string; password?: string };
+    if (username !== adminAuthConfig.username || password !== adminAuthConfig.password) {
+      sendJson(response, 401, { error: "账号或密码不正确。" });
+      return;
+    }
+
+    const token = createAdminToken();
+    sendAdminSessionCookie(response, token);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/admin/logout") {
+    clearAdminSessionCookie(response);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === "GET" && pathname === "/api/admin/bootstrap") {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+    sendJson(response, 200, serializeAdminBootstrap());
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/admin/archives/import") {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const { payload } = (await readJsonBody(request)) as { payload?: unknown };
+    if (!payload) {
+      sendJson(response, 400, { error: "缺少导入内容。" });
+      return;
+    }
+
+    const archivePath = importArchivePayload(payload, archiveDir);
+    const summary = listArchivedCases(archiveDir).find((item) => item.filePath === archivePath);
+    sendJson(response, 200, {
+      ok: true,
+      archive: summary ?? null,
+    });
+    return;
+  }
+
+  const adminArchiveExportMatch = pathname.match(/^\/api\/admin\/archives\/([^/]+)\/export$/u);
+  if (request.method === "GET" && adminArchiveExportMatch) {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const archiveSummary = listArchivedCases(archiveDir).find((item) => item.archiveId === adminArchiveExportMatch[1]!);
+    if (!archiveSummary) {
+      sendJson(response, 404, { error: "归档案件不存在。" });
+      return;
+    }
+
+    const archive = loadArchivedCase(archiveSummary.filePath);
+    sendJsonDownload(response, buildDownloadFileName(`${archive.mysteryCase.title}--archive`), archive);
+    return;
+  }
+
+  const adminArchiveDetailMatch = pathname.match(/^\/api\/admin\/archives\/([^/]+)$/u);
+  if (request.method === "GET" && adminArchiveDetailMatch) {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const archiveSummary = listArchivedCases(archiveDir).find((item) => item.archiveId === adminArchiveDetailMatch[1]!);
+    if (!archiveSummary) {
+      sendJson(response, 404, { error: "归档案件不存在。" });
+      return;
+    }
+
+    const archive = loadArchivedCase(archiveSummary.filePath);
+    sendJson(response, 200, {
+      archive: {
+        archiveId: archive.archiveId,
+        archivedAt: archive.archivedAt,
+        source: archive.source,
+        review: archive.review,
+        diagnostics: archive.diagnostics,
+        mysteryCase: archive.mysteryCase,
+      },
+    });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/admin/model-selection") {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const body = (await readJsonBody(request)) as {
+      playPresetId?: unknown;
+      generatorPresetId?: unknown;
+      reviewerPresetId?: unknown;
+    };
+    store.setSetting("admin.modelSelection", {
+      playPresetId: normalizeAdminSelectionValue(body.playPresetId),
+      generatorPresetId: normalizeAdminSelectionValue(body.generatorPresetId),
+      reviewerPresetId: normalizeAdminSelectionValue(body.reviewerPresetId),
+    } satisfies AdminModelSelection);
+    sendJson(response, 200, { ok: true, selection: getAdminModelSelection() });
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/admin/cases/generate") {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const { templateType } = (await readJsonBody(request)) as { templateType?: TemplateType };
+    if (!CASE_TEMPLATES.some((template) => template.type === templateType)) {
+      sendJson(response, 400, { error: "案件模板不存在。" });
+      return;
+    }
+
+    const activeGenerationJob = getLatestActiveGenerationJob();
+    sendJson(response, 202, {
+      jobId: activeGenerationJob?.id ?? startGenerationJob(templateType),
+      reused: Boolean(activeGenerationJob),
+    });
+    return;
+  }
+
+  const adminJobMatch = pathname.match(/^\/api\/admin\/generation-jobs\/([^/]+)$/u);
+  if (request.method === "GET" && adminJobMatch) {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const job = generationJobs.get(adminJobMatch[1]!);
+    if (!job) {
+      sendJson(response, 404, { error: "生成任务不存在。" });
+      return;
+    }
+
+    sendJson(response, 200, job);
+    return;
+  }
+
+  const adminArchiveMatch = pathname.match(/^\/api\/admin\/archives\/([^/]+)$/u);
+  if (request.method === "DELETE" && adminArchiveMatch) {
+    if (!assertAdminAccess(request, response)) {
+      return;
+    }
+
+    const deleted = deleteArchivedCase(adminArchiveMatch[1]!, archiveDir);
+    if (!deleted) {
+      sendJson(response, 404, { error: "归档案件不存在。" });
+      return;
+    }
+
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
   if (request.method === "GET" && pathname === "/api/bootstrap") {
     sendJson(response, 200, serializeBootstrap());
     return;
   }
 
+  if (request.method === "POST" && pathname === "/api/voice-input/transcribe") {
+    await handleVoiceInputTranscription(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && pathname === "/api/voice-input/session/start") {
+    await handleStartVoiceInputSession(response);
+    return;
+  }
+
+  const voiceChunkMatch = pathname.match(/^\/api\/voice-input\/session\/([^/]+)\/chunk$/u);
+  if (request.method === "POST" && voiceChunkMatch) {
+    await handleVoiceInputChunk(request, response, voiceChunkMatch[1]!);
+    return;
+  }
+
+  const voiceStopMatch = pathname.match(/^\/api\/voice-input\/session\/([^/]+)\/stop$/u);
+  if (request.method === "POST" && voiceStopMatch) {
+    await handleStopVoiceInputSession(response, voiceStopMatch[1]!);
+    return;
+  }
+
+  const voiceAbortMatch = pathname.match(/^\/api\/voice-input\/session\/([^/]+)$/u);
+  if (request.method === "DELETE" && voiceAbortMatch) {
+    await handleAbortVoiceInputSession(response, voiceAbortMatch[1]!);
+    return;
+  }
+
   if (request.method === "POST" && pathname === "/api/session/new") {
-    const activeGenerationJob = getLatestActiveGenerationJob();
-    sendJson(response, 202, {
-      jobId: activeGenerationJob?.id ?? startGenerationJob(),
-      reused: Boolean(activeGenerationJob),
-    });
+    sendJson(response, 403, { error: "玩家界面不再直接生成案件，请到 /admin 管理后台操作。" });
     return;
   }
 
@@ -503,23 +1149,6 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, path
     }
 
     sendJson(response, 200, job);
-    return;
-  }
-
-  if (request.method === "POST" && pathname === "/api/session/resume-latest") {
-    const latest = store.getLatestActiveSession();
-    if (!latest) {
-      sendJson(response, 404, { error: "没有可恢复的最近一局。" });
-      return;
-    }
-
-    const mysteryCase = store.getCase(latest.caseId);
-    if (!mysteryCase) {
-      sendJson(response, 404, { error: "最近一局案件不存在。" });
-      return;
-    }
-
-    sendJson(response, 200, { session: serializeSession(mysteryCase, latest) });
     return;
   }
 
@@ -559,9 +1188,7 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, path
 
   const messageMatch = pathname.match(/^\/api\/session\/([^/]+)\/messages\/([^/]+)$/u);
   if (request.method === "GET" && messageMatch) {
-    const sessionId = messageMatch[1]!;
-    const suspectId = messageMatch[2]!;
-    sendJson(response, 200, { messages: store.listMessages(sessionId, suspectId) });
+    sendJson(response, 200, { messages: [] });
     return;
   }
 
@@ -627,13 +1254,33 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (pathname === "/admin") {
+      sendText(response, 200, ADMIN_HTML, "text/html; charset=utf-8");
+      return;
+    }
+
     if (pathname === "/app.js") {
       sendText(response, 200, APP_JS, "application/javascript; charset=utf-8");
       return;
     }
 
+    if (pathname === "/admin.js") {
+      sendText(response, 200, ADMIN_JS, "application/javascript; charset=utf-8");
+      return;
+    }
+
     if (pathname === "/styles.css") {
       sendText(response, 200, STYLES_CSS, "text/css; charset=utf-8");
+      return;
+    }
+
+    if (pathname === "/vendor/sweetalert2.js") {
+      sendText(response, 200, SWEETALERT_JS, "application/javascript; charset=utf-8");
+      return;
+    }
+
+    if (pathname === "/vendor/sweetalert2.css") {
+      sendText(response, 200, SWEETALERT_CSS, "text/css; charset=utf-8");
       return;
     }
 

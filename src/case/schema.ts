@@ -41,14 +41,18 @@ function normalizeComparableText(value: string) {
     .toLowerCase();
 }
 
-function isVisualHintTooCloseToDiscovery(visualHint: string | undefined, discovery: string) {
+function isVisualHintTooCloseToNodeText(visualHint: string | undefined, summary: string, discovery: string) {
   if (!visualHint?.trim()) {
     return true;
   }
 
   const normalizedHint = normalizeComparableText(visualHint);
+  const normalizedSummary = normalizeComparableText(summary);
   const normalizedDiscovery = normalizeComparableText(discovery);
   return (
+    normalizedHint === normalizedSummary ||
+    normalizedHint.includes(normalizedSummary) ||
+    normalizedSummary.includes(normalizedHint) ||
     normalizedHint === normalizedDiscovery ||
     normalizedHint.includes(normalizedDiscovery) ||
     normalizedDiscovery.includes(normalizedHint)
@@ -56,7 +60,10 @@ function isVisualHintTooCloseToDiscovery(visualHint: string | undefined, discove
 }
 
 function buildVisualHintFallback(node: {
+  title: string;
+  category: string;
   summary: string;
+  contradictionIds: string[];
   clueIllustration?: {
     items: Array<{
       label: string;
@@ -68,7 +75,15 @@ function buildVisualHintFallback(node: {
     return `第一眼会先注意到 ${labels.slice(0, 3).join("、")}。`;
   }
 
-  return node.summary;
+  const fallbackLabels = Array.from(
+    new Set(
+      [labels[0], node.title, node.contradictionIds[0], node.category === "scene" ? "现场异常" : undefined, node.category === "forensic" ? "检验痕迹" : undefined, node.category === "timeline" ? "时间错位" : undefined, node.category === "relationship" ? "人物互动异常" : undefined, node.category === "object" ? "关键物件" : undefined]
+        .map((item) => String(item ?? "").trim())
+        .filter(Boolean),
+    ),
+  );
+
+  return `第一眼会先注意到 ${fallbackLabels.slice(0, 2).join("、")}。`;
 }
 
 function buildClueIllustrationFallback(node: {
@@ -243,6 +258,20 @@ function clampArray<T>(items: T[], max: number): T[] {
   return items.length > max ? items.slice(0, max) : items;
 }
 
+const DEFAULT_SCENE_ROLE_POSITIONS = {
+  suspects: [
+    { x: 20, y: 22 },
+    { x: 80, y: 22 },
+    { x: 18, y: 76 },
+    { x: 82, y: 76 },
+  ],
+  npcs: [
+    { x: 10, y: 48 },
+    { x: 90, y: 48 },
+    { x: 50, y: 86 },
+  ],
+};
+
 function normalizeReference(input: string): string {
   return input.replace(/[^\p{Letter}\p{Number}]+/gu, "").toLowerCase();
 }
@@ -314,7 +343,7 @@ const sceneIllustrationSchema = z.preprocess(
       locationLabel: z.string().min(1),
       atmosphere: z.string().min(1),
       focusCaption: z.string().min(1),
-      figures: z.array(sceneFigureSchema).min(1).max(6),
+      figures: z.array(sceneFigureSchema).min(1).max(8),
       props: z.array(scenePropSchema).min(4).max(10),
     })
     .optional(),
@@ -505,13 +534,21 @@ export const casePackageSchema = z
               pose: "倒在现场中央或关键物件旁",
               expression: "失去反应",
             },
-            ...value.suspects.slice(0, 2).map((suspect, index) => ({
+            ...value.suspects.map((suspect, index) => ({
               characterId: suspect.id,
               label: suspect.name,
               role: "suspect" as const,
-              position: { x: 26 + index * 46, y: 22 + index * 10 },
+              position: DEFAULT_SCENE_ROLE_POSITIONS.suspects[index] ?? { x: 18 + (index % 2) * 64, y: 18 + Math.floor(index / 2) * 58 },
               pose: "站在案发空间边缘，保持距离观察现场",
               expression: suspect.demeanor,
+            })),
+            ...(value.npcs ?? []).map((npc, index) => ({
+              characterId: npc.id,
+              label: npc.name,
+              role: "npc" as const,
+              position: DEFAULT_SCENE_ROLE_POSITIONS.npcs[index] ?? { x: 14 + index * 28, y: 86 },
+              pose: "站在场景边缘观察局势",
+              expression: npc.demeanor,
             })),
           ],
           props: [
@@ -541,14 +578,21 @@ export const casePackageSchema = z
         appearanceSummary: npc.appearanceSummary ?? `${npc.publicPersona}，看上去${npc.demeanor}，是这起案件里第 ${index + 1} 个值得追问的旁支角色。`,
       })),
       investigationNodes: value.investigationNodes.map((node) => {
-        const visualHint = isVisualHintTooCloseToDiscovery(node.visualHint, node.discovery)
-          ? buildVisualHintFallback(node)
-          : (node.visualHint ?? buildVisualHintFallback(node));
+        const clueIllustration = node.clueIllustration ?? buildClueIllustrationFallback(node, node.visualHint ?? `聚焦 ${node.title} 里的关键位置与痕迹。`);
+        const visualHint = isVisualHintTooCloseToNodeText(node.visualHint, node.summary, node.discovery)
+          ? buildVisualHintFallback({
+              ...node,
+              clueIllustration,
+            })
+          : (node.visualHint ?? buildVisualHintFallback({
+              ...node,
+              clueIllustration,
+            }));
 
         return {
           ...node,
           visualHint,
-          clueIllustration: node.clueIllustration ?? buildClueIllustrationFallback(node, visualHint),
+          clueIllustration,
           contradictionIds: node.contradictionIds.map((reference) => resolveContradictionReference(reference, contradictionTitles) ?? reference),
         };
       }),

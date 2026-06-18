@@ -1,9 +1,11 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import type { CaseGenerationDiagnostics } from "../case/generator.js";
 import type { CaseReview } from "../case/reviewer.js";
 import { normalizeMysteryCase, type MysteryCase } from "../case/schema.js";
+import { stripCaseVisualAssets } from "../case/visuals.js";
 
 export type ArchivedCaseRecord = {
   archiveId: string;
@@ -23,10 +25,15 @@ export type ArchivedCaseRecord = {
 export type ArchivedCaseSummary = {
   archiveId: string;
   archivedAt: string;
+  caseId: string;
   title: string;
   template: MysteryCase["template"];
   suspects: number;
   overallScore?: number;
+  sourceModel?: string;
+  reviewModel?: string;
+  presetId?: string;
+  reviewPresetId?: string;
   filePath: string;
 };
 
@@ -52,9 +59,10 @@ function createArchivePath(record: ArchivedCaseRecord, archiveDir: string): stri
 
 export function archiveApprovedCase(record: ArchivedCaseRecord, archiveDir = DEFAULT_ARCHIVE_DIR): string {
   ensureArchiveDir(archiveDir);
+  const normalizedCase = normalizeMysteryCase(record.mysteryCase);
   const normalizedRecord: ArchivedCaseRecord = {
     ...record,
-    mysteryCase: normalizeMysteryCase(record.mysteryCase),
+    mysteryCase: stripCaseVisualAssets(normalizedCase),
   };
   const filePath = createArchivePath(record, archiveDir);
   writeFileSync(filePath, JSON.stringify(normalizedRecord, null, 2), "utf-8");
@@ -74,10 +82,15 @@ export function listArchivedCases(archiveDir = DEFAULT_ARCHIVE_DIR): ArchivedCas
       return {
         archiveId: record.archiveId,
         archivedAt: record.archivedAt,
+        caseId: record.mysteryCase.id,
         title: record.mysteryCase.title,
         template: record.mysteryCase.template,
         suspects: record.mysteryCase.suspects.length,
         overallScore: record.review?.overallScore,
+        sourceModel: record.source.model,
+        reviewModel: record.source.reviewModel,
+        presetId: record.source.presetId,
+        reviewPresetId: record.source.reviewPresetId,
         filePath,
       } satisfies ArchivedCaseSummary;
     })
@@ -90,4 +103,49 @@ export function loadArchivedCase(filePath: string): ArchivedCaseRecord {
     ...parsed,
     mysteryCase: normalizeMysteryCase(parsed.mysteryCase),
   };
+}
+
+export function deleteArchivedCase(archiveId: string, archiveDir = DEFAULT_ARCHIVE_DIR): boolean {
+  const target = listArchivedCases(archiveDir).find((item) => item.archiveId === archiveId);
+  if (!target) {
+    return false;
+  }
+
+  unlinkSync(target.filePath);
+  return true;
+}
+
+function isArchiveRecordLike(input: unknown): input is Partial<ArchivedCaseRecord> & { mysteryCase: unknown } {
+  return Boolean(input && typeof input === "object" && "mysteryCase" in input);
+}
+
+export function importArchivePayload(input: unknown, archiveDir = DEFAULT_ARCHIVE_DIR): string {
+  const baseRecord = isArchiveRecordLike(input) ? input : null;
+  const normalizedCase = normalizeMysteryCase(baseRecord?.mysteryCase ?? input);
+  const mysteryCase = {
+    ...normalizedCase,
+    id: `case_${randomUUID()}`,
+  } satisfies MysteryCase;
+
+  return archiveApprovedCase(
+    {
+      archiveId: `archive_${randomUUID()}`,
+      archivedAt: new Date().toISOString(),
+      source: baseRecord?.source?.model
+        ? {
+            model: baseRecord.source.model,
+            reviewModel: baseRecord.source.reviewModel,
+            presetId: baseRecord.source.presetId,
+            reviewPresetId: baseRecord.source.reviewPresetId,
+            structuredOutputMode: baseRecord.source.structuredOutputMode,
+          }
+        : {
+            model: "imported-json",
+          },
+      diagnostics: baseRecord?.diagnostics,
+      review: baseRecord?.review,
+      mysteryCase,
+    },
+    archiveDir,
+  );
 }

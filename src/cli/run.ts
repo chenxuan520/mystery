@@ -3,9 +3,11 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 import { archiveApprovedCase, DEFAULT_ARCHIVE_DIR, listArchivedCases, loadArchivedCase } from "../archive/story-archive.js";
-import type { MysteryCase, InvestigationNode, Suspect } from "../case/schema.js";
+import type { MysteryCase, InvestigationNode, Npc, Suspect } from "../case/schema.js";
 import { generateCasePackageWithDiagnostics } from "../case/generator.js";
-import { generateSuspectReply } from "../chat/suspect-chat.js";
+import { DialogueMemory } from "../chat/dialogue-memory.js";
+import { buildHintMasterCharacter, generateHintMasterReply, HINT_MASTER_ID } from "../chat/hint-master.js";
+import { generateSuspectReply, type DialogueCharacter } from "../chat/suspect-chat.js";
 import { loadRuntimeConfig, loadRuntimeConfigForRole } from "../config/runtime-config.js";
 import { judgeAccusation } from "../judgement/judge.js";
 import { OpenAiGateway } from "../llm/openai-gateway.js";
@@ -156,7 +158,7 @@ function formatArchiveLabel(summary: ReturnType<typeof listArchivedCases>[number
 }
 
 function printSuspectProfiles(mysteryCase: MysteryCase) {
-  console.log("\n嫌疑人档案：");
+  console.log("\n角色档案：");
   for (const suspect of mysteryCase.suspects) {
     console.log(`\n- ${suspect.name}`);
     console.log(`  身份：${suspect.publicPersona}`);
@@ -164,6 +166,52 @@ function printSuspectProfiles(mysteryCase: MysteryCase) {
     console.log(`  表面动机：${suspect.possibleMotive}`);
     console.log(`  对外口供：${suspect.alibi}`);
   }
+
+  for (const npc of mysteryCase.npcs ?? []) {
+    console.log(`\n- ${npc.name}`);
+    console.log(`  身份：${npc.publicPersona}`);
+    console.log(`  与死者关系：${npc.relationshipToVictim}`);
+    console.log(`  为什么值得问：${npc.whyRelevant}`);
+  }
+
+  const hintMaster = buildHintMasterCharacter();
+  console.log(`\n- ${hintMaster.name}`);
+  console.log(`  身份：${hintMaster.publicPersona}`);
+  console.log(`  角色定位：${hintMaster.relationshipToVictim}`);
+  console.log(`  可提供帮助：${hintMaster.whyRelevant}`);
+}
+
+type CliDialogueEntry = {
+  id: string;
+  name: string;
+  label: string;
+  character?: DialogueCharacter;
+  type: "character" | "hint-master";
+};
+
+function buildCliDialogueEntries(mysteryCase: MysteryCase): CliDialogueEntry[] {
+  return [
+    ...mysteryCase.suspects.map((suspect) => ({
+      id: suspect.id,
+      name: suspect.name,
+      label: `${suspect.name}：${suspect.publicPersona}`,
+      character: suspect as Suspect,
+      type: "character" as const,
+    })),
+    ...(mysteryCase.npcs ?? []).map((npc) => ({
+      id: npc.id,
+      name: npc.name,
+      label: `${npc.name}：${npc.publicPersona}`,
+      character: npc as Npc,
+      type: "character" as const,
+    })),
+    {
+      id: HINT_MASTER_ID,
+      name: buildHintMasterCharacter().name,
+      label: `${buildHintMasterCharacter().name}：${buildHintMasterCharacter().publicPersona}`,
+      type: "hint-master",
+    },
+  ];
 }
 
 function printInvestigationNotebook(mysteryCase: MysteryCase, session: StoredSession) {
@@ -277,6 +325,8 @@ async function restoreOrCreateSession(
       console.log(`\n已载入归档案件《${archive.mysteryCase.title}》。`);
       return { mysteryCase: archive.mysteryCase, session };
     }
+
+    return restoreOrCreateSession(rl, store, generationGateway, reviewGateway, archiveDir);
   }
 
   if (selected?.action === "exit") {
@@ -319,19 +369,21 @@ async function handleChat(
   gateway: OpenAiGateway,
   mysteryCase: MysteryCase,
   session: StoredSession,
+  dialogueMemory: DialogueMemory,
 ) {
+  const dialogueEntries = buildCliDialogueEntries(mysteryCase);
   const index = await chooseIndex(
     rl,
-    "选择要对话的嫌疑人：",
-    mysteryCase.suspects.map((suspect) => `${suspect.name}：${suspect.publicPersona}`),
+    "选择要对话的角色：",
+    dialogueEntries.map((entry) => entry.label),
   );
 
   if (index === null) {
     return;
   }
 
-  const suspect = mysteryCase.suspects[index] as Suspect;
-  console.log(`\n开始和 ${suspect.name} 对话。直接回车可结束当前对话。`);
+  const entry = dialogueEntries[index]!;
+  console.log(`\n开始和 ${entry.name} 对话。直接回车可结束当前对话。`);
 
   while (true) {
     const userInput = await askText(rl, "你：");
@@ -339,20 +391,24 @@ async function handleChat(
       break;
     }
 
-    const history = store.listMessages(session.id, suspect.id);
-    store.appendMessage(session.id, suspect.id, "user", userInput);
+    const history = dialogueMemory.getHistory(entry.id);
+    dialogueMemory.append(entry.id, { role: "user", content: userInput });
+    store.touchSession(session.id);
 
-    const reply = await generateSuspectReply(
-      gateway,
-      mysteryCase,
-      suspect,
-      visitedNodes(mysteryCase, session),
-      history,
-      userInput,
-    );
+    const reply =
+      entry.type === "hint-master"
+        ? await generateHintMasterReply(gateway, mysteryCase, visitedNodes(mysteryCase, session), history, userInput, session.status === "solved")
+        : await generateSuspectReply(
+            gateway,
+            mysteryCase,
+            entry.character as DialogueCharacter,
+            visitedNodes(mysteryCase, session),
+            history,
+            userInput,
+          );
 
-    store.appendMessage(session.id, suspect.id, "assistant", reply);
-    console.log(`${suspect.name}：${reply}`);
+    dialogueMemory.append(entry.id, { role: "assistant", content: reply });
+    console.log(`${entry.name}：${reply}`);
   }
 }
 
@@ -416,6 +472,7 @@ async function gameLoop(
   gateway: OpenAiGateway,
   mysteryCase: MysteryCase,
   session: StoredSession,
+  dialogueMemory: DialogueMemory,
 ) {
   let currentSession = session;
 
@@ -426,7 +483,7 @@ async function gameLoop(
     const choice = await chooseIndex(
       rl,
       "选择操作：",
-      ["查看调查节点", "询问嫌疑人", "查看嫌疑人档案", "查看已知线索", "指认真凶", "重新查看案件摘要", "保存并退出"],
+      ["查看调查节点", "询问角色", "查看角色档案", "查看已知线索", "指认真凶", "重新查看案件摘要", "保存并退出"],
       false,
     );
 
@@ -435,7 +492,7 @@ async function gameLoop(
         await handleInvestigation(rl, store, mysteryCase, currentSession);
         break;
       case 1:
-        await handleChat(rl, store, gateway, mysteryCase, currentSession);
+        await handleChat(rl, store, gateway, mysteryCase, currentSession, dialogueMemory);
         break;
       case 2:
         printSuspectProfiles(mysteryCase);
@@ -471,13 +528,15 @@ export async function runCli() {
   const reviewGateway = new OpenAiGateway(reviewConfig);
   const archiveDir = process.env.ARCHIVE_DIR ?? DEFAULT_ARCHIVE_DIR;
   const store = new SessionStore(playConfig.databasePath);
+  const dialogueMemory = new DialogueMemory();
   const rl = supportsInteractiveMenus() ? null : createInterface({ input, output });
 
   try {
     console.log(`已加载游玩模型（来源：${playConfig.source}，模型：${playConfig.openaiModel}）`);
     console.log(`案件生成模型：${generationConfig.openaiModel} / 案件评审模型：${reviewConfig.openaiModel}`);
     const { mysteryCase, session } = await restoreOrCreateSession(rl, store, generationGateway, reviewGateway, archiveDir);
-    await gameLoop(rl, store, gateway, mysteryCase, session);
+    dialogueMemory.clear();
+    await gameLoop(rl, store, gateway, mysteryCase, session, dialogueMemory);
   } catch (error) {
     if (error instanceof InputClosedError) {
       console.log("\n输入已结束，游戏退出。\n");

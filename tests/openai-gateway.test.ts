@@ -77,4 +77,64 @@ describe("OpenAiGateway", () => {
     expect(result).toEqual({ value: "ok" });
     expect(create).toHaveBeenCalledTimes(2);
   });
+
+  it("模型输出被截断后会放大 max_tokens 并带上上次输出前缀重试", async () => {
+    const gateway = createGateway();
+    const create = vi.fn(async (params) => {
+      if (create.mock.calls.length === 1) {
+        return {
+          choices: [{ finish_reason: "length", message: { content: JSON.stringify({ partial: "x" }).slice(0, 10) } }],
+        };
+      }
+
+      return {
+        choices: [
+          {
+            finish_reason: "stop",
+            message: {
+              content: JSON.stringify({ value: "ok" }),
+            },
+          },
+        ],
+      };
+    });
+
+    Reflect.set(gateway as object, "client", {
+      chat: {
+        completions: {
+          create,
+        },
+      },
+    });
+
+    const result = await gateway.completeJson("system", "user", z.object({ value: z.string() }), 100);
+
+    expect(result).toEqual({ value: "ok" });
+    expect(create).toHaveBeenCalledTimes(2);
+    const firstParams = create.mock.calls[0]?.[0];
+    const secondParams = create.mock.calls[1]?.[0];
+    expect(secondParams.max_tokens).toBeGreaterThan(firstParams.max_tokens);
+    expect(secondParams.messages[1].content).toContain("上次输出前缀");
+  });
+
+  it("模型最终仍然截断时会把 partialOutput 挂到错误对象上", async () => {
+    const gateway = createGateway();
+    const create = vi.fn(async () => ({
+      choices: [{ finish_reason: "length", message: { content: "{\"partial\":true" } }],
+    }));
+
+    Reflect.set(gateway as object, "client", {
+      chat: {
+        completions: {
+          create,
+        },
+      },
+    });
+
+    await expect(gateway.completeJson("system", "user", z.object({ value: z.string() }), 100)).rejects.toMatchObject({
+      message: "模型输出被截断。",
+      partialOutput: '{"partial":true',
+    });
+    expect(create).toHaveBeenCalledTimes(3);
+  });
 });

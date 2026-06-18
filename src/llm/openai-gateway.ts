@@ -37,6 +37,31 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+function truncateRetryPreview(text: string, maxChars = 1200): string {
+  const normalized = text.trim();
+  if (!normalized) {
+    return "";
+  }
+
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxChars)}…`;
+}
+
+function attachPartialOutput(error: unknown, partialOutput: string) {
+  if (!partialOutput) {
+    return error;
+  }
+
+  if (error instanceof Error) {
+    return Object.assign(error, { partialOutput });
+  }
+
+  return Object.assign(new Error(String(error)), { partialOutput });
+}
+
 type RetriableApiError = { status?: number; headers?: unknown; error?: { type?: string } };
 
 function isTimeoutError(error: unknown): boolean {
@@ -195,6 +220,22 @@ export class OpenAiGateway {
     throw new Error("模型没有返回结构化内容。");
   }
 
+  private extractStructuredRawText(message: {
+    content?: string | null;
+    tool_calls?: Array<{ function?: { arguments?: string } }>;
+  }): string {
+    const toolArguments = message.tool_calls?.[0]?.function?.arguments;
+    if (typeof toolArguments === "string" && toolArguments.trim()) {
+      return toolArguments;
+    }
+
+    if (typeof message.content === "string" && message.content.trim()) {
+      return message.content;
+    }
+
+    return "";
+  }
+
   private parseStructuredSchema<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, payload: unknown): T {
     try {
       return schema.parse(payload);
@@ -278,14 +319,18 @@ export class OpenAiGateway {
     maxTokens = 3800,
   ): Promise<T> {
     let lastError: unknown;
+    let lastPartialOutput = "";
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const structuredMode =
         attempt === 1 ? this.structuredOutputMode : this.structuredOutputMode === "tool_call" ? "json_object" : this.structuredOutputMode;
+      const retryReason = lastError instanceof Error ? lastError.message : String(lastError ?? "");
+      const retryPreview = truncateRetryPreview(lastPartialOutput);
       const retryNote =
         attempt === 1
           ? ""
-          : `\n\n上一次输出未通过校验，原因：${String(lastError)}。这次请严格输出完整 JSON，并检查引号、逗号、数组闭合和必填字段，不要输出空对象。`;
+          : `\n\n上一次输出未通过校验，原因：${retryReason}。这次请严格输出完整 JSON，并检查引号、逗号、数组闭合和必填字段，不要输出空对象。如果上次是因为长度不够被截断，请重新从头输出完整 JSON，并主动压缩不必要的说明文字，确保整份对象一次输出完。${retryPreview ? `\n\n上次输出前缀（仅供你保持结构，不要续写半截 JSON，必须从头重写完整 JSON）：\n${retryPreview}` : ""}`;
+      const attemptMaxTokens = attempt === 1 ? maxTokens : Math.min(maxTokens + 1800 * (attempt - 1), maxTokens * 2);
 
       const response = await this.withRetry(() =>
         this.runWithAbortTimeout((requestOptions) =>
@@ -293,7 +338,7 @@ export class OpenAiGateway {
             this.buildRequestBody({
               model: this.model,
               temperature: attempt === 1 ? 0.45 : 0.25,
-              max_tokens: maxTokens + (attempt - 1) * 600,
+              max_tokens: attemptMaxTokens,
               ...(structuredMode === "json_object"
                 ? { response_format: { type: "json_object" as const } }
                 : {
@@ -331,22 +376,28 @@ export class OpenAiGateway {
       const message = response.choices[0]?.message;
       if (!message) {
         lastError = new Error("模型没有返回内容。");
+        lastPartialOutput = "";
         continue;
       }
 
+      lastPartialOutput = this.extractStructuredRawText(message);
+
       if (finishReason === "length") {
-        lastError = new Error("模型输出被截断。");
+        lastError = attachPartialOutput(new Error("模型输出被截断。"), lastPartialOutput);
         continue;
       }
 
       try {
         return this.parseStructuredSchema(schema, this.extractStructuredPayload(message));
       } catch (error) {
-        lastError = error;
+        lastError = attachPartialOutput(error, lastPartialOutput);
       }
     }
 
-    throw lastError instanceof Error ? lastError : new Error(`模型 JSON 生成失败：${String(lastError)}`);
+    throw attachPartialOutput(
+      lastError instanceof Error ? lastError : new Error(`模型 JSON 生成失败：${String(lastError)}`),
+      lastPartialOutput,
+    );
   }
 
   async chat(messages: ChatCompletionMessageParam[], temperature = 0.7, maxTokens = 300): Promise<string> {

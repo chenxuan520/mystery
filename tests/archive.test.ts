@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { archiveApprovedCase, listArchivedCases, loadArchivedCase } from "../src/archive/story-archive.js";
+import { archiveApprovedCase, importArchivePayload, listArchivedCases, loadArchivedCase } from "../src/archive/story-archive.js";
 import { sampleCase } from "./fixtures/sample-case.js";
 
 const tempDirs: string[] = [];
@@ -54,9 +54,26 @@ describe("story archive", () => {
 
     const summaries = listArchivedCases(dir);
     const loaded = loadArchivedCase(archivePath);
+    const rawRecord = JSON.parse(readFileSync(archivePath, "utf8")) as {
+      mysteryCase: { sceneSvg?: string; suspects: Array<{ avatarSvg?: string }> };
+    };
 
     expect(summaries).toHaveLength(1);
     expect(summaries[0]?.overallScore).toBe(85);
     expect(loaded.mysteryCase.title).toBe(sampleCase.title);
+    expect(loaded.mysteryCase.sceneSvg?.includes("<svg")).toBe(true);
+    expect(rawRecord.mysteryCase.sceneSvg).toBeUndefined();
+    expect(rawRecord.mysteryCase.suspects.every((suspect) => suspect.avatarSvg === undefined)).toBe(true);
+  });
+
+  it("导入案件 JSON 时会生成新的案件 id，避免覆盖旧会话引用", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mystery-archive-import-"));
+    tempDirs.push(dir);
+
+    const importedPath = importArchivePayload(sampleCase, dir);
+    const imported = loadArchivedCase(importedPath);
+
+    expect(imported.mysteryCase.id).not.toBe(sampleCase.id);
+    expect(imported.mysteryCase.title).toBe(sampleCase.title);
   });
 });

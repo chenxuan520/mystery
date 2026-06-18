@@ -132,7 +132,52 @@ function buildRevisionPrompt(
   promptMode: PromptMode = "full",
   existingTitles: string[] = [],
 ) {
-  const editableCase = stripGeneratedVisuals(currentCase);
+  const strippedCase = stripGeneratedVisuals(currentCase);
+  const editableCase =
+    promptMode === "playable"
+      ? {
+          id: strippedCase.id,
+          template: strippedCase.template,
+          title: strippedCase.title,
+          openingNarration: strippedCase.openingNarration,
+          publicSummary: strippedCase.publicSummary,
+          playerGoal: strippedCase.playerGoal,
+          victim: strippedCase.victim,
+          suspects: strippedCase.suspects.map((suspect) => ({
+            id: suspect.id,
+            name: suspect.name,
+            publicPersona: suspect.publicPersona,
+            relationshipToVictim: suspect.relationshipToVictim,
+            possibleMotive: suspect.possibleMotive,
+            alibi: suspect.alibi,
+            demeanor: suspect.demeanor,
+            speakingStyle: suspect.speakingStyle,
+            pressurePoint: suspect.pressurePoint,
+            knows: suspect.knows,
+            hides: suspect.hides,
+          })),
+          npcs: (strippedCase.npcs ?? []).map((npc) => ({
+            id: npc.id,
+            name: npc.name,
+            publicPersona: npc.publicPersona,
+            relationshipToVictim: npc.relationshipToVictim,
+            whyRelevant: npc.whyRelevant,
+            demeanor: npc.demeanor,
+            speakingStyle: npc.speakingStyle,
+            knows: npc.knows,
+            hides: npc.hides,
+          })),
+          investigationNodes: strippedCase.investigationNodes.map((node) => ({
+            id: node.id,
+            title: node.title,
+            category: node.category,
+            summary: node.summary,
+            discovery: node.discovery,
+            contradictionIds: node.contradictionIds,
+          })),
+          solution: strippedCase.solution,
+        }
+      : strippedCase;
 
   return [
     `请修订下面这份“${template.label}”案件。`,
@@ -340,7 +385,7 @@ export async function generateCasePackage(
 }
 
 export const PLAYABLE_CASE_GENERATION_OPTIONS: CaseGenerationOptions = {
-  maxAttempts: 2,
+  maxAttempts: 3,
   reviewThreshold: PLAYABLE_CASE_REVIEW_THRESHOLD,
   acceptLastAttemptIfDeterministicPasses: true,
   promptMode: "playable",

@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 
 import { normalizeMysteryCase, type MysteryCase } from "../case/schema.js";
+import { stripCaseVisualAssets } from "../case/visuals.js";
 
 export type SessionStatus = "active" | "solved" | "abandoned";
 
@@ -20,12 +21,21 @@ export type StoredSession = {
   updatedAt: string;
 };
 
-export type StoredMessage = {
-  id: number;
-  sessionId: string;
-  suspectId: string;
-  role: "user" | "assistant";
-  content: string;
+export type StoredGenerationFailure = {
+  id: string;
+  jobId: string;
+  templateType?: string;
+  phase?: string;
+  progressMessage?: string;
+  attempt?: number;
+  totalAttempts?: number;
+  error: string;
+  rawError?: string;
+  partialOutput?: string;
+  generatorModel: string;
+  reviewModel?: string;
+  generatorPresetId?: string;
+  reviewPresetId?: string;
   createdAt: string;
 };
 
@@ -74,19 +84,25 @@ export class SessionStore {
         updated_at TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        suspect_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT NOT NULL
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS generation_failures (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL
       );
     `);
+
+    this.db.exec(`DROP TABLE IF EXISTS messages;`);
   }
 
   saveCase(mysteryCase: MysteryCase) {
     const normalizedCase = normalizeMysteryCase(mysteryCase);
+    const storageCase = stripCaseVisualAssets(normalizedCase);
     const createdAt = nowIso();
     const statement = this.db.prepare(
       `INSERT OR REPLACE INTO cases (id, template, title, payload, created_at)
@@ -94,10 +110,10 @@ export class SessionStore {
     );
 
     statement.run({
-      id: normalizedCase.id,
-      template: normalizedCase.template,
-      title: normalizedCase.title,
-      payload: JSON.stringify(normalizedCase),
+      id: storageCase.id,
+      template: storageCase.template,
+      title: storageCase.title,
+      payload: JSON.stringify(storageCase),
       created_at: createdAt,
     });
   }
@@ -171,43 +187,56 @@ export class SessionStore {
     this.db.prepare(`UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), sessionId);
   }
 
-  appendMessage(sessionId: string, suspectId: string, role: "user" | "assistant", content: string) {
-    const createdAt = nowIso();
-    this.db
-      .prepare(
-        `INSERT INTO messages (session_id, suspect_id, role, content, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(sessionId, suspectId, role, content, createdAt);
-
-    this.db.prepare(`UPDATE sessions SET updated_at = ? WHERE id = ?`).run(createdAt, sessionId);
+  touchSession(sessionId: string) {
+    this.db.prepare(`UPDATE sessions SET updated_at = ? WHERE id = ?`).run(nowIso(), sessionId);
   }
 
-  listMessages(sessionId: string, suspectId: string): StoredMessage[] {
-    const rows = this.db
-      .prepare(
-        `SELECT id, session_id, suspect_id, role, content, created_at
-         FROM messages
-         WHERE session_id = ? AND suspect_id = ?
-         ORDER BY id ASC`,
-      )
-      .all(sessionId, suspectId) as Array<{
-      id: number;
-      session_id: string;
-      suspect_id: string;
-      role: "user" | "assistant";
-      content: string;
-      created_at: string;
-    }>;
+  getSetting<T>(key: string): T | null {
+    const row = this.db.prepare(`SELECT value_json FROM settings WHERE key = ?`).get(key) as { value_json: string } | undefined;
+    if (!row) {
+      return null;
+    }
 
-    return rows.map((row) => ({
-      id: row.id,
-      sessionId: row.session_id,
-      suspectId: row.suspect_id,
-      role: row.role,
-      content: row.content,
-      createdAt: row.created_at,
-    }));
+    return JSON.parse(row.value_json) as T;
+  }
+
+  setSetting(key: string, value: unknown) {
+    this.db
+      .prepare(
+        `INSERT INTO settings (key, value_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+      )
+      .run(key, JSON.stringify(value), nowIso());
+  }
+
+  recordGenerationFailure(failure: StoredGenerationFailure) {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO generation_failures (id, created_at, payload_json)
+         VALUES (@id, @created_at, @payload_json)`,
+      )
+      .run({
+        id: failure.id,
+        created_at: failure.createdAt,
+        payload_json: JSON.stringify(failure),
+      });
+  }
+
+  getLatestGenerationFailure(): StoredGenerationFailure | null {
+    const row = this.db
+      .prepare(`SELECT payload_json FROM generation_failures ORDER BY created_at DESC LIMIT 1`)
+      .get() as { payload_json: string } | undefined;
+
+    return row ? (JSON.parse(row.payload_json) as StoredGenerationFailure) : null;
+  }
+
+  listGenerationFailures(limit = 20): StoredGenerationFailure[] {
+    const rows = this.db
+      .prepare(`SELECT payload_json FROM generation_failures ORDER BY created_at DESC LIMIT ?`)
+      .all(limit) as Array<{ payload_json: string }>;
+
+    return rows.map((row) => JSON.parse(row.payload_json) as StoredGenerationFailure);
   }
 
   close() {

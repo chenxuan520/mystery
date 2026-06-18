@@ -88,6 +88,27 @@ function loadFromPreset(env: NodeJS.ProcessEnv, role: RuntimeRole): RuntimeConfi
   };
 }
 
+export function loadRuntimeConfigFromPresetId(presetId: string, env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
+  const presetPath = resolvePresetPath(env);
+  if (!presetPath) {
+    throw new Error("未找到 AI_PRESET_PATH，对应 preset 无法加载。");
+  }
+
+  const preset = loadAiPresetById(presetId, presetPath);
+  return {
+    openaiBaseUrl: normalizeBaseUrl(preset.endpoint),
+    openaiApiKey: preset.token,
+    openaiModel: preset.model,
+    databasePath: env.DATABASE_PATH ?? "data/mystery.sqlite",
+    openaiHeaders: preset.extra_headers,
+    structuredOutputMode: preset.structured_output,
+    defaultMaxTokens: preset.max_tokens,
+    extraBody: preset.extra_body,
+    presetId: preset.id,
+    source: "preset",
+  };
+}
+
 function loadFromOpencodeConfig(env: NodeJS.ProcessEnv) {
   if (!env.OPENCODE_CONFIG_CONTENT) {
     return null;
@@ -131,6 +152,14 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
 }
 
 export function loadRuntimeConfigForRole(role: RuntimeRole, env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
+  const specificPresetId = role === "generator" ? env.CASE_GENERATOR_PRESET_ID : role === "reviewer" ? env.CASE_REVIEWER_PRESET_ID : undefined;
+  if (specificPresetId) {
+    const fromSpecificPreset = loadFromPreset(env, role);
+    if (fromSpecificPreset) {
+      return fromSpecificPreset;
+    }
+  }
+
   const envBaseUrl = env.OPENAI_BASE_URL;
   const envApiKey = env.OPENAI_API_KEY;
   const envModel = env.OPENAI_MODEL;
