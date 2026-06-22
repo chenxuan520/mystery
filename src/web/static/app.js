@@ -196,6 +196,17 @@ function sanitizeCachedJudgement(input) {
     return null;
   }
 
+  const deduction =
+    input.deduction && typeof input.deduction === "object" && !Array.isArray(input.deduction) && typeof input.deduction.verdict === "string"
+      ? {
+          score: Number.isFinite(input.deduction.score) ? input.deduction.score : 0,
+          verdict: input.deduction.verdict,
+          hitPoints: Array.isArray(input.deduction.hitPoints) ? input.deduction.hitPoints.filter((item) => typeof item === "string") : [],
+          missedPoints: Array.isArray(input.deduction.missedPoints) ? input.deduction.missedPoints.filter((item) => typeof item === "string") : [],
+          feedback: typeof input.deduction.feedback === "string" ? input.deduction.feedback : "",
+        }
+      : null;
+
   return {
     correct: Boolean(input.correct),
     culpritName: input.culpritName,
@@ -206,6 +217,8 @@ function sanitizeCachedJudgement(input) {
     redHerrings: input.redHerrings.filter((item) => typeof item === "string"),
     keyContradictions,
     hiddenRelationships,
+    deduction,
+    consequence: typeof input.consequence === "string" ? input.consequence : null,
   };
 }
 
@@ -307,6 +320,16 @@ function buildChatLocalCacheSnapshot() {
             surface: item.surface,
             hiddenTruth: item.hiddenTruth,
           })),
+          deduction: state.judgement.deduction
+            ? {
+                score: state.judgement.deduction.score,
+                verdict: state.judgement.deduction.verdict,
+                hitPoints: [...(state.judgement.deduction.hitPoints ?? [])],
+                missedPoints: [...(state.judgement.deduction.missedPoints ?? [])],
+                feedback: state.judgement.deduction.feedback,
+              }
+            : null,
+          consequence: state.judgement.consequence ?? null,
         }
       : null,
   };
@@ -1611,6 +1634,52 @@ async function openHintMasterChat() {
   focusChatInput();
 }
 
+function scoreTier(score) {
+  if (score >= 85) {
+    return { label: "神探级", variant: "high" };
+  }
+  if (score >= 60) {
+    return { label: "推理在线", variant: "mid" };
+  }
+  if (score >= 35) {
+    return { label: "还差火候", variant: "low" };
+  }
+  return { label: "蒙的成分大", variant: "low" };
+}
+
+function renderConsequenceHtml(judgement) {
+  if (!judgement?.consequence) {
+    return "";
+  }
+
+  const label = judgement.correct ? "结局" : "误判后果";
+  return `<div class="note result-consequence"><strong>${label}</strong>${escapeHtml(judgement.consequence)}</div>`;
+}
+
+function renderDeductionHtml(deduction) {
+  if (!deduction) {
+    return "";
+  }
+
+  const tier = scoreTier(deduction.score);
+  const hits = (deduction.hitPoints ?? []).filter(Boolean);
+  const misses = (deduction.missedPoints ?? []).filter(Boolean);
+
+  return `
+    <div class="note deduction-card">
+      <div class="deduction-head">
+        <strong>破案评分</strong>
+        <span class="deduction-score deduction-${tier.variant}">${deduction.score}<small>/100</small></span>
+        <span class="deduction-tier">${escapeHtml(tier.label)}</span>
+      </div>
+      ${deduction.verdict ? `<div class="deduction-verdict">${escapeHtml(deduction.verdict)}</div>` : ""}
+      ${hits.length ? `<div class="deduction-line"><span class="deduction-hit">推到的点</span>${hits.map((item) => `<div>- ${escapeHtml(item)}</div>`).join("")}</div>` : ""}
+      ${misses.length ? `<div class="deduction-line"><span class="deduction-miss">漏掉的点</span>${misses.map((item) => `<div>- ${escapeHtml(item)}</div>`).join("")}</div>` : ""}
+      ${deduction.feedback ? `<div class="deduction-feedback">${escapeHtml(deduction.feedback)}</div>` : ""}
+    </div>
+  `;
+}
+
 function renderJudgementHintMasterFollowup() {
   const hintMaster = hintMasterCharacter();
   if (!hintMaster || state.selectedCharacterId !== hintMaster.id || state.hintMasterChatMode !== "judgement") {
@@ -1649,16 +1718,14 @@ function renderJudgementHintMasterFollowup() {
   `;
 }
 
-async function sendChat() {
+async function runChatTurn({ text, confrontNodeId = null }) {
   const characterId = state.selectedCharacterId;
   const chatKey = currentChatKey();
-  const text = currentChatDraft().trim();
 
   if (!characterId || !chatKey || !text || state.voicePhase !== "idle" || state.chatPending) {
     return;
   }
 
-  setCurrentChatDraft("");
   const messages = state.messagesByCharacter[chatKey] ?? [];
   const userMessage = { role: "user", content: text };
   const assistantMessage = { role: "assistant", content: "" };
@@ -1669,12 +1736,16 @@ async function sendChat() {
 
   try {
     const history = messages.map((message) => ({ role: message.role, content: message.content }));
+    const body = { userInput: text, history };
+    if (confrontNodeId) {
+      body.confrontNodeId = confrontNodeId;
+    }
     const response = await fetch(`/api/session/${state.session.sessionId}/chat/${characterId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ userInput: text, history }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok || !response.body) {
@@ -1715,6 +1786,33 @@ async function sendChat() {
   }
 }
 
+async function sendChat() {
+  const chatKey = currentChatKey();
+  const text = currentChatDraft().trim();
+
+  if (!state.selectedCharacterId || !chatKey || !text || state.voicePhase !== "idle" || state.chatPending) {
+    return;
+  }
+
+  setCurrentChatDraft("");
+  await runChatTurn({ text });
+}
+
+async function confrontWithClue(nodeId) {
+  await abortVoiceInput();
+
+  if (!state.session || !state.selectedCharacterId || state.chatPending) {
+    return;
+  }
+
+  const node = state.session.notebook?.find((item) => item.id === nodeId);
+  if (!node) {
+    return;
+  }
+
+  await runChatTurn({ text: `（出示线索：${node.title}）你怎么解释？`, confrontNodeId: nodeId });
+}
+
 async function accuseSelected() {
   await abortVoiceInput();
 
@@ -1727,29 +1825,87 @@ async function accuseSelected() {
     return;
   }
 
-  const confirmed = await confirmAction({
-    title: `确认指认 ${suspect.name} 吗？`,
-    text: "确认后会直接进入结案判定。",
-    confirmText: "确认指认",
-    cancelText: "再想想",
-    icon: "warning",
-  });
-  if (!confirmed) {
+  const details = await promptAccusationDetails(suspect);
+  if (!details) {
     return;
   }
 
-  setBusy("正在判定...");
+  const accusedId = state.selectedCharacterId;
+  setBusy("正在判定与复盘...");
   try {
     const data = await fetchJson(`/api/session/${state.session.sessionId}/accuse`, {
       method: "POST",
-      body: JSON.stringify({ suspectId: state.selectedCharacterId }),
+      body: JSON.stringify({ suspectId: accusedId, reasoning: details.reasoning, citedNodeIds: details.citedNodeIds }),
     });
     state.session = data.session;
     state.judgement = data.judgement;
+    state.selectedNode = null;
+    state.selectedCharacterId = null;
+    state.hintMasterChatMode = null;
     schedulePersistChatLocalCache();
   } finally {
     clearBusy();
   }
+}
+
+async function promptAccusationDetails(suspect) {
+  const clues = state.session?.notebook ?? [];
+
+  if (window.Swal?.fire) {
+    const cluesHtml = clues.length
+      ? clues
+          .map(
+            (node) =>
+              `<label class="accuse-clue"><input type="checkbox" value="${escapeHtml(node.id)}" /><span>${escapeHtml(node.title)}</span></label>`,
+          )
+          .join("")
+      : `<div class="accuse-empty">你还没有调查到任何线索，可以直接凭推理指认。</div>`;
+
+    const result = await window.Swal.fire({
+      title: `指认 ${escapeHtml(suspect.name)}`,
+      html: `
+        <div class="accuse-form">
+          <div class="accuse-section-title">勾选支撑你判断的线索</div>
+          <div class="accuse-clue-list">${cluesHtml}</div>
+          <div class="accuse-section-title">写下你的推理</div>
+          <textarea id="accuse-reasoning" class="accuse-reasoning" rows="4" placeholder="说说为什么是 ${escapeHtml(suspect.name)}：动机、手法、关键矛盾..."></textarea>
+        </div>
+      `,
+      showCancelButton: true,
+      confirmButtonText: "提交指认",
+      cancelButtonText: "再想想",
+      reverseButtons: true,
+      background: "#111827",
+      color: "#f8fafc",
+      confirmButtonColor: "#2563eb",
+      cancelButtonColor: "#374151",
+      focusConfirm: false,
+      customClass: {
+        popup: "mystery-swal-popup",
+        title: "mystery-swal-title",
+        htmlContainer: "mystery-swal-text",
+      },
+      preConfirm: () => {
+        const reasoning = document.querySelector("#accuse-reasoning")?.value?.trim() ?? "";
+        const citedNodeIds = Array.from(document.querySelectorAll(".accuse-clue input:checked")).map((input) => input.value);
+        return { reasoning, citedNodeIds };
+      },
+    });
+
+    if (!result.isConfirmed) {
+      return null;
+    }
+
+    return result.value ?? { reasoning: "", citedNodeIds: [] };
+  }
+
+  const confirmed = window.confirm(`确认指认 ${suspect.name} 吗？`);
+  if (!confirmed) {
+    return null;
+  }
+
+  const reasoning = window.prompt(`写下你指认 ${suspect.name} 的推理（可留空）：`) ?? "";
+  return { reasoning, citedNodeIds: [] };
 }
 
 async function revealAnswer() {
@@ -2097,9 +2253,11 @@ function renderMainPanel() {
   if (state.judgement && !state.selectedNode && (!state.selectedCharacterId || hintMasterFollowupOpen)) {
 
     return `
-      <div class="card judgement result-panel">
+      <div class="card judgement result-panel ${state.judgement.correct ? "result-correct" : "result-wrong"}">
         <h2 class="section-title">结案结果</h2>
         <div class="note"><strong>${escapeHtml(state.judgement.summary)}</strong>${escapeHtml(state.judgement.truthReveal)}</div>
+        ${renderConsequenceHtml(state.judgement)}
+        ${renderDeductionHtml(state.judgement.deduction)}
         <div class="note"><strong>真凶作案链路</strong>${state.judgement.culpritPlan.map((item) => `<div>- ${escapeHtml(item)}</div>`).join("")}</div>
         <div class="note"><strong>关键矛盾</strong>${state.judgement.keyContradictions.map((item) => `<div>- ${escapeHtml(item.title)}：${escapeHtml(item.implication)}</div>`).join("")}</div>
         <div class="note"><strong>误导点</strong>${state.judgement.redHerrings.map((item) => `<div>- ${escapeHtml(item)}</div>`).join("")}</div>
@@ -2186,6 +2344,22 @@ function renderMainPanel() {
         <div class="chat-log" id="chat-log">
           ${renderCurrentChatMessagesHtml(character)}
         </div>
+        ${
+          !isHintMaster
+            ? (state.session.notebook?.length ?? 0) > 0
+              ? `<div class="confront-row">
+                  <span class="confront-label">出示线索对质</span>
+                  <select id="confront-select" ${state.chatPending ? "disabled" : ""}>
+                    ${state.session.notebook.map((node) => `<option value="${escapeHtml(node.id)}">${escapeHtml(node.title)}</option>`).join("")}
+                  </select>
+                  <button class="ghost" id="confront-button" ${state.chatPending || state.voicePhase !== "idle" ? "disabled" : ""}>出示</button>
+                </div>`
+              : `<div class="confront-row confront-empty">
+                  <span class="confront-label">出示线索对质</span>
+                  <span class="muted">先去左侧“调查节点”查到线索，才能拿证据当面对质。</span>
+                </div>`
+            : ""
+        }
         <div class="chat-form">
           <input id="chat-input" value="${escapeHtml(currentChatDraft())}" placeholder="${placeholderText}" ${state.busy ? "disabled" : ""} />
           ${showVoiceButton ? `<button class="ghost voice-button ${state.voicePhase === "recording" ? "recording" : ""}" id="toggle-voice" ${voiceButtonDisabled ? "disabled" : ""}>${currentVoiceButtonText()}</button>` : ""}
@@ -2279,6 +2453,12 @@ function renderGame() {
     setCurrentChatDraft(event.target.value);
   });
   document.querySelector("#send-chat")?.addEventListener("click", sendChat);
+  document.querySelector("#confront-button")?.addEventListener("click", () => {
+    const select = document.querySelector("#confront-select");
+    if (select?.value) {
+      void confrontWithClue(select.value);
+    }
+  });
   document.querySelector("#toggle-voice")?.addEventListener("click", () => {
     void toggleVoiceInput();
   });

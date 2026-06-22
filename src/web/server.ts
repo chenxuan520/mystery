@@ -12,7 +12,7 @@ import { streamSuspectReply } from "../chat/suspect-chat.js";
 import { loadAdminAuthConfig, loadAdminModelPresets, serializeAdminModelOptions } from "../config/admin-config.js";
 import { loadRuntimeConfig, loadRuntimeConfigForRole, loadRuntimeConfigFromPresetId } from "../config/runtime-config.js";
 import { loadVoiceInputConfig, serializeVoiceInputConfig } from "../config/voice-input-config.js";
-import { judgeAccusation, revealSolution } from "../judgement/judge.js";
+import { buildFallbackConsequence, evaluateAccusation, judgeAccusation, revealSolution } from "../judgement/judge.js";
 import { OpenAiGateway } from "../llm/openai-gateway.js";
 import { SessionStore, type StoredGenerationFailure, type StoredSession } from "../session/store.js";
 import {
@@ -765,7 +765,11 @@ async function handleInvestigation(sessionId: string, nodeId: string) {
 }
 
 async function handleChatStream(request: IncomingMessage, response: ServerResponse, sessionId: string, suspectId: string) {
-  const { userInput, history: rawHistory } = (await readJsonBody(request)) as { userInput?: string; history?: unknown };
+  const { userInput, history: rawHistory, confrontNodeId } = (await readJsonBody(request)) as {
+    userInput?: string;
+    history?: unknown;
+    confrontNodeId?: string;
+  };
   if (!userInput?.trim()) {
     sendJson(response, 400, { error: "聊天内容不能为空。" });
     return;
@@ -778,6 +782,11 @@ async function handleChatStream(request: IncomingMessage, response: ServerRespon
     sendJson(response, 404, { error: "角色不存在。" });
     return;
   }
+
+  const confrontNode =
+    !isHintMaster && typeof confrontNodeId === "string"
+      ? mysteryCase.investigationNodes.find((node) => node.id === confrontNodeId)
+      : undefined;
 
   const history = sanitizeDialogueHistory(rawHistory);
   store.touchSession(session.id);
@@ -793,7 +802,7 @@ async function handleChatStream(request: IncomingMessage, response: ServerRespon
   try {
     const replyStream = isHintMaster
       ? streamHintMasterReply(playGateway, mysteryCase, visitedNodes(mysteryCase, session), history, userInput.trim(), session.status === "solved")
-      : streamSuspectReply(playGateway, mysteryCase, character as Suspect | Npc, visitedNodes(mysteryCase, session), history, userInput.trim());
+      : streamSuspectReply(playGateway, mysteryCase, character as Suspect | Npc, visitedNodes(mysteryCase, session), history, userInput.trim(), confrontNode);
 
     for await (const chunk of replyStream) {
       assistantReply += chunk;
@@ -1200,20 +1209,45 @@ async function routeApi(request: IncomingMessage, response: ServerResponse, path
 
   const accuseMatch = pathname.match(/^\/api\/session\/([^/]+)\/accuse$/u);
   if (request.method === "POST" && accuseMatch) {
-    const { suspectId } = (await readJsonBody(request)) as { suspectId?: string };
+    const { suspectId, reasoning: rawReasoning, citedNodeIds: rawCitedNodeIds } = (await readJsonBody(request)) as {
+      suspectId?: string;
+      reasoning?: unknown;
+      citedNodeIds?: unknown;
+    };
     if (!suspectId) {
       sendJson(response, 400, { error: "缺少 suspectId。" });
       return;
     }
 
     const { session, mysteryCase } = getSessionContext(accuseMatch[1]!);
+    if (!mysteryCase.suspects.some((suspect) => suspect.id === suspectId)) {
+      sendJson(response, 404, { error: "嫌疑人不存在。" });
+      return;
+    }
+
+    const reasoning = typeof rawReasoning === "string" ? rawReasoning : "";
+    const citedNodeIds = Array.isArray(rawCitedNodeIds) ? rawCitedNodeIds.filter((id): id is string => typeof id === "string") : [];
+    const citedNodes = mysteryCase.investigationNodes.filter((node) => citedNodeIds.includes(node.id));
+
     store.updateSessionState(session.id, (state) => ({
       ...state,
       accusedSuspectId: suspectId,
     }));
     store.updateSessionStatus(session.id, "solved");
+
+    const judgement = judgeAccusation(mysteryCase, suspectId);
+
+    try {
+      const evaluation = await evaluateAccusation(getPlayGateway(), mysteryCase, suspectId, reasoning, citedNodes);
+      judgement.deduction = evaluation.deduction;
+      judgement.consequence = evaluation.consequence;
+    } catch (error) {
+      console.error("[Web] 结案推理评估失败，使用兜底结局：", error);
+      judgement.consequence = buildFallbackConsequence(mysteryCase, suspectId);
+    }
+
     sendJson(response, 200, {
-      judgement: judgeAccusation(mysteryCase, suspectId),
+      judgement,
       session: serializeSession(mysteryCase, store.getSession(session.id) ?? session),
     });
     return;

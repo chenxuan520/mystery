@@ -9,7 +9,7 @@ import { DialogueMemory } from "../chat/dialogue-memory.js";
 import { buildHintMasterCharacter, generateHintMasterReply, HINT_MASTER_ID } from "../chat/hint-master.js";
 import { generateSuspectReply, type DialogueCharacter } from "../chat/suspect-chat.js";
 import { loadRuntimeConfig, loadRuntimeConfigForRole } from "../config/runtime-config.js";
-import { judgeAccusation } from "../judgement/judge.js";
+import { buildFallbackConsequence, evaluateAccusation, judgeAccusation, type JudgementResult } from "../judgement/judge.js";
 import { OpenAiGateway } from "../llm/openai-gateway.js";
 import { SessionStore, type StoredSession } from "../session/store.js";
 
@@ -383,12 +383,47 @@ async function handleChat(
   }
 
   const entry = dialogueEntries[index]!;
+  const isCharacter = entry.type === "character";
+  const known = visitedNodes(mysteryCase, session);
   console.log(`\n开始和 ${entry.name} 对话。直接回车可结束当前对话。`);
+  if (isCharacter && known.length > 0) {
+    console.log("提示：可以选择“出示线索对质”，把已查到的线索甩到对方脸上。");
+  }
 
   while (true) {
-    const userInput = await askText(rl, "你：");
-    if (!userInput) {
-      break;
+    let userInput: string;
+    let confrontNode: InvestigationNode | undefined;
+
+    if (isCharacter && known.length > 0) {
+      const mode = await chooseIndex(rl, `和 ${entry.name} 的对话：`, ["自由提问", "出示线索对质"], true);
+      if (mode === null) {
+        break;
+      }
+
+      if (mode === 1) {
+        const clueIndex = await chooseIndex(
+          rl,
+          "出示哪条线索？",
+          known.map((node) => `${node.title}：${node.discovery}`),
+        );
+        if (clueIndex === null) {
+          continue;
+        }
+
+        confrontNode = known[clueIndex];
+        userInput = `（出示线索：${confrontNode!.title}）你怎么解释？`;
+        console.log(`\n你出示了线索：${confrontNode!.title}`);
+      } else {
+        userInput = await askText(rl, "你：");
+        if (!userInput) {
+          break;
+        }
+      }
+    } else {
+      userInput = await askText(rl, "你：");
+      if (!userInput) {
+        break;
+      }
     }
 
     const history = dialogueMemory.getHistory(entry.id);
@@ -397,14 +432,15 @@ async function handleChat(
 
     const reply =
       entry.type === "hint-master"
-        ? await generateHintMasterReply(gateway, mysteryCase, visitedNodes(mysteryCase, session), history, userInput, session.status === "solved")
+        ? await generateHintMasterReply(gateway, mysteryCase, known, history, userInput, session.status === "solved")
         : await generateSuspectReply(
             gateway,
             mysteryCase,
             entry.character as DialogueCharacter,
-            visitedNodes(mysteryCase, session),
+            known,
             history,
             userInput,
+            confrontNode,
           );
 
     dialogueMemory.append(entry.id, { role: "assistant", content: reply });
@@ -412,9 +448,32 @@ async function handleChat(
   }
 }
 
-function printJudgement(mysteryCase: MysteryCase, accusedId: string) {
-  const result = judgeAccusation(mysteryCase, accusedId);
+function printJudgementResult(mysteryCase: MysteryCase, result: JudgementResult) {
   console.log(`\n${result.summary}`);
+
+  if (result.consequence) {
+    console.log(`\n${result.correct ? "结局" : "误判后果"}：${result.consequence}`);
+  }
+
+  if (result.deduction) {
+    console.log(`\n破案评分：${result.deduction.score}/100（${result.deduction.verdict}）`);
+    if (result.deduction.hitPoints.length) {
+      console.log("推到的点：");
+      for (const point of result.deduction.hitPoints) {
+        console.log(`- ${point}`);
+      }
+    }
+    if (result.deduction.missedPoints.length) {
+      console.log("漏掉的点：");
+      for (const point of result.deduction.missedPoints) {
+        console.log(`- ${point}`);
+      }
+    }
+    if (result.deduction.feedback) {
+      console.log(`点评：${result.deduction.feedback}`);
+    }
+  }
+
   console.log(`\n真相还原：${result.truthReveal}`);
   console.log("\n真凶作案链路：");
   for (const step of result.culpritPlan) {
@@ -439,7 +498,13 @@ function printJudgement(mysteryCase: MysteryCase, accusedId: string) {
   }
 }
 
-async function handleAccusation(rl: Interface | null, store: SessionStore, mysteryCase: MysteryCase, session: StoredSession): Promise<boolean> {
+async function handleAccusation(
+  rl: Interface | null,
+  store: SessionStore,
+  gateway: OpenAiGateway,
+  mysteryCase: MysteryCase,
+  session: StoredSession,
+): Promise<boolean> {
   const index = await chooseIndex(
     rl,
     "你要指认谁是凶手？",
@@ -457,12 +522,26 @@ async function handleAccusation(rl: Interface | null, store: SessionStore, myste
     return false;
   }
 
+  const reasoning = await askText(rl, "说说你的推理（可直接回车跳过）：");
+
   store.updateSessionState(session.id, (state) => ({
     ...state,
     accusedSuspectId: suspect.id,
   }));
   store.updateSessionStatus(session.id, "solved");
-  printJudgement(mysteryCase, suspect.id);
+
+  const judgement = judgeAccusation(mysteryCase, suspect.id);
+  console.log("\n正在判定与复盘...");
+  try {
+    const evaluation = await evaluateAccusation(gateway, mysteryCase, suspect.id, reasoning, visitedNodes(mysteryCase, session));
+    judgement.deduction = evaluation.deduction;
+    judgement.consequence = evaluation.consequence;
+  } catch (error) {
+    console.error(`推理评估失败，使用兜底结局：${error instanceof Error ? error.message : String(error)}`);
+    judgement.consequence = buildFallbackConsequence(mysteryCase, suspect.id);
+  }
+
+  printJudgementResult(mysteryCase, judgement);
   return true;
 }
 
@@ -501,7 +580,7 @@ async function gameLoop(
         printInvestigationNotebook(mysteryCase, currentSession);
         break;
       case 4: {
-        const finished = await handleAccusation(rl, store, mysteryCase, currentSession);
+        const finished = await handleAccusation(rl, store, gateway, mysteryCase, currentSession);
         if (finished) {
           return;
         }
