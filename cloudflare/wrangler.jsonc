@@ -1,0 +1,42 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "mystery-cloudflare",
+  "main": "./src/index.ts",
+  "compatibility_date": "2026-06-23",
+  "routes": [
+    {
+      "pattern": "mystery.011203.xyz",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "APP_KV",
+      "id": "b7286e5254b740cd8c81871097edea30"
+    }
+  ],
+  "assets": {
+    "directory": "../src/web/static",
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "run_worker_first": true
+  },
+  "vars": {
+    "PLAY_MODEL": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "GENERATOR_MODEL": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "REVIEW_MODEL": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "VOICE_INPUT_ENABLED": "true",
+    "VOICE_INPUT_MODEL": "@cf/openai/whisper-large-v3-turbo",
+    "VOICE_INPUT_LANGUAGE": "zh",
+    "VOICE_INPUT_CHUNK_MS": "1000",
+    "VOICE_INPUT_MAX_DURATION_SECONDS": "180"
+  }
+}

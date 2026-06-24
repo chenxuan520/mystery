@@ -116,6 +116,43 @@ VOICE_INPUT_MAX_DURATION_SECONDS=180
 
 ## 运行
 
+### Cloudflare Workers 版（新增）
+
+仓库现在额外提供一套独立的 Cloudflare 适配层，目录在：
+
+```text
+cloudflare/
+```
+
+当前 Cloudflare 版会：
+
+- 把 Web 玩家界面和 `/admin` 管理后台部署到 Workers
+- 把文本模型切到 Workers AI
+- 把语音输入切到 Workers AI Whisper
+- 把案件 / 会话 / 归档 / 设置 / 生成任务改存到 KV
+- 当前更稳的玩法链路是：**本地生成归档 JSON，再到 Cloudflare `/admin` 导入后重玩**
+
+快速开始：
+
+```bash
+cd cloudflare
+npm install
+npm run check
+```
+
+如果你想把本地 `data/approved-cases/` 里的已归档案件批量同步到 Cloudflare 网页端：
+
+```bash
+cd cloudflare
+npm run import:approved
+```
+
+部署前请先把 `cloudflare/wrangler.jsonc` 里的 KV namespace id 换成你自己的，并按需设置 `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_SESSION_SECRET` secrets。更完整说明见：
+
+```text
+cloudflare/README.md
+```
+
 ### 推荐：Web 版
 
 ```bash

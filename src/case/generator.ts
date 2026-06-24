@@ -1,5 +1,3 @@
-import { randomUUID } from "node:crypto";
-
 import { assessCaseQuality } from "./quality.js";
 import {
   formatCaseReviewFeedback,
@@ -120,7 +118,7 @@ function buildUserPrompt(
     "- keyContradictions 的 summary / implication 各控制在 1 句",
     "- hiddenRelationships 的 hiddenTruth 控制在 1 句",
     ...extraFeedback,
-    `案件 id 固定写成 ${randomUUID()}`,
+    `案件 id 固定写成 ${crypto.randomUUID()}`,
     `template 固定写成 ${template.type}`,
   ].join("\n");
 }

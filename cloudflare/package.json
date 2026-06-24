@@ -1,0 +1,16 @@
+{
+  "name": "mystery-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "types": "wrangler types ./worker-configuration.d.ts",
+    "import:approved": "node ./scripts/import-approved-cases.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "wrangler": "^4.22.0"
+  }
+}
